@@ -11,10 +11,29 @@ The common pattern is:
 
 This was shaped around Radxa/Rockchip + Armbian, but it is generic for ARM64 Debian/Ubuntu/Armbian companions such as Radxa Rock, Raspberry Pi 5, Ampere boxes, and ARM mini PCs.
 
+## Use Cases
+
+Use an ARM companion when you want Docker work to happen somewhere other than your Mac, while keeping the Mac as your editor and command center.
+
+- Save Mac CPU, RAM, disk, and battery during heavy Compose stacks, image builds, databases, queues, and test environments.
+- Avoid Docker Desktop overhead on macOS by using a real Linux Docker Engine on the LAN.
+- Keep long-running development services alive while the Mac sleeps, reboots, travels, or switches projects.
+- Run ARM-native Linux containers and builds without emulation surprises.
+- Put noisy or stateful services such as Postgres, Redis, ClickHouse, Ollama, CI runners, media tools, and build caches on an always-on machine.
+- Share one stable Docker host across multiple project checkouts or multiple Macs on the same trusted network.
+- Use Colima only as a local fallback instead of making the Mac carry every workload all the time.
+- Turn a Radxa, Raspberry Pi, or ARM mini PC into a lightweight home-lab build and service node.
+
+This is not a Kubernetes replacement and it is not a good fit for untrusted networks, high-latency remote links, or workloads that need all project files to stay strictly local unless you configure that explicitly.
+
+See [Use Cases](docs/use-cases.md) for concrete examples.
+
+If an AI agent is doing the setup for you, see [AGENTS.md](AGENTS.md) for the SSH-driven runbook and safety rules.
+
 ## Quick Start
 
 ```sh
-git clone https://github.com/YOUR_ORG/arm-docker-companion.git
+git clone https://github.com/edulelis/arm-docker-companion.git
 cd arm-docker-companion
 cp config/companion.env.example .env
 $EDITOR .env
