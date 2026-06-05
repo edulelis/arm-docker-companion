@@ -1,0 +1,5 @@
+services:
+  smoke:
+    image: alpine:3.22
+    command: ["sh", "-lc", "uname -a && echo docker-context-ok"]
+
