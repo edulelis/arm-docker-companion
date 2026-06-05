@@ -11,22 +11,32 @@ The common pattern is:
 
 This was shaped around Radxa/Rockchip + Armbian, but it is generic for ARM64 Debian/Ubuntu/Armbian companions such as Radxa Rock, Raspberry Pi 5, Ampere boxes, and ARM mini PCs.
 
-## Use Cases
+## Why This Exists
 
-Use an ARM companion when you want Docker work to happen somewhere other than your Mac, while keeping the Mac as your editor and command center.
+ARM Macs are excellent developer machines, but Docker can still become the thing that makes them feel heavy: large Compose stacks eat RAM, image builds heat the machine, local volumes fill the internal SSD, and long-running services disappear when the Mac sleeps or reboots.
 
-- Save Mac CPU, RAM, disk, and battery during heavy Compose stacks, image builds, databases, queues, and test environments.
-- Avoid Docker Desktop overhead on macOS by using a real Linux Docker Engine on the LAN.
-- Keep long-running development services alive while the Mac sleeps, reboots, travels, or switches projects.
-- Run ARM-native Linux containers and builds without emulation surprises.
-- Put noisy or stateful services such as Postgres, Redis, ClickHouse, Ollama, CI runners, media tools, and build caches on an always-on machine.
-- Share one stable Docker host across multiple project checkouts or multiple Macs on the same trusted network.
-- Use Colima only as a local fallback instead of making the Mac carry every workload all the time.
-- Turn a Radxa, Raspberry Pi, or ARM mini PC into a lightweight home-lab build and service node.
+This project lets the Mac stay the command center while an ARM Linux companion does the container work. You keep using `docker`, `docker compose`, and Buildx from the Mac, but the daemon, images, volumes, databases, queues, workers, and test containers live on another machine.
 
-This is not a Kubernetes replacement and it is not a good fit for untrusted networks, high-latency remote links, or workloads that need all project files to stay strictly local unless you configure that explicitly.
+Good use cases:
 
-See [Use Cases](docs/use-cases.md) for concrete examples.
+- Save Mac CPU, RAM, disk, and battery during heavy Docker workloads.
+- Move Postgres, Redis, ClickHouse, queues, workers, AI services, media tools, and build caches onto an always-on machine.
+- Avoid Docker Desktop overhead by using a real Linux Docker Engine on the LAN.
+- Keep development services running while the Mac sleeps, reboots, travels, or switches projects.
+- Run ARM-native Linux containers and builds without macOS VM behavior or emulation surprises.
+- Share one stable Docker host across multiple project checkouts or multiple Macs on a trusted network.
+- Keep Docker data on external SSD/NVMe attached to the companion instead of filling the Mac's internal storage.
+- Use Colima as a local fallback instead of making the Mac carry every container workload all the time.
+- Turn a Radxa, Raspberry Pi, or ARM mini PC into a practical home-lab build and service node.
+
+Concrete examples:
+
+- A monorepo with API, frontend, Postgres, Redis, workers, and integration tests runs on the companion while your editor and browser stay responsive on the Mac.
+- A database-heavy project keeps volumes and seed data on the companion SSD, so switching branches or rebooting the Mac does not destroy the local service state.
+- A home-lab setup keeps reverse proxies, dashboards, local AI, CI runners, or smoke-test services online even when the Mac is closed.
+- A team or household with multiple ARM Macs points Docker contexts at one trusted LAN host instead of duplicating large images and volumes on every machine.
+
+This is not a Kubernetes replacement. It is also not a good fit for untrusted networks, high-latency remote links, x86-only workloads, or projects where every source file and container volume must remain strictly local to the Mac.
 
 If an AI agent is doing the setup for you, see [AGENTS.md](AGENTS.md) for the SSH-driven runbook and safety rules.
 
