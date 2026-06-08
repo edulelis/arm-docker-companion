@@ -61,6 +61,7 @@ Use the Mac dev tunnel healer:
 ```sh
 DOCKER_CONTEXT_NAME=radxa \
 COMPANION_HOST=rock-5a.local \
+COMPANION_HOST_FALLBACKS="192.0.2.10" \
 COMPANION_USER=eduardo \
 COMPANION_SSH_ALIAS=radxa \
 COMPANION_DOCKER_ENDPOINT=tcp://rock-5a.local:23750 \
@@ -77,7 +78,19 @@ By default the healer reads `docker --context "$DOCKER_CONTEXT_NAME" ps`,
 mirrors every published TCP host port onto Mac `127.0.0.1`, stops Colima only
 when Colima owns one of those ports, and repairs broken SSH forwards on the next
 watch pass. The launchd watcher starts retrying after 5 seconds, exponentially
-backs off on failures, and caps retries at 60 seconds by default.
+backs off on failures, caps retries at 60 seconds by default, and bounds each
+Docker endpoint probe to 5 seconds when `gtimeout`/`timeout` is available.
+
+If mDNS is stale or intermittent, set `COMPANION_HOST_FALLBACKS` to one or more
+direct IPs/hostnames. When `COMPANION_DOCKER_ENDPOINT` uses `COMPANION_HOST`,
+the tunnel healer tries the original endpoint first and then equivalent
+endpoints with each fallback host. When an SSH alias is configured, the healer
+also tries `ssh://$COMPANION_SSH_ALIAS` as a transport fallback after TCP
+endpoint candidates. Use `COMPANION_SSH_HOST` when the generated SSH alias
+should point at a direct IP instead of the primary host name.
+For endpoints that cannot be derived from the primary host, set full
+space-separated `COMPANION_DOCKER_ENDPOINT_FALLBACKS`. Tune
+`DEV_TUNNEL_DOCKER_PROBE_TIMEOUT_SECONDS` if a network needs longer probes.
 
 Extra non-Docker forwards can be declared with `DEV_TUNNEL_FORWARDS`:
 

@@ -12,10 +12,13 @@ fi
 
 DOCKER_CONTEXT_NAME=${DOCKER_CONTEXT_NAME:-arm-companion}
 COMPANION_HOST=${COMPANION_HOST:-}
+COMPANION_HOST_FALLBACKS=${COMPANION_HOST_FALLBACKS:-}
 COMPANION_USER=${COMPANION_USER:-}
 COMPANION_SSH_ALIAS=${COMPANION_SSH_ALIAS:-$DOCKER_CONTEXT_NAME}
+COMPANION_SSH_HOST=${COMPANION_SSH_HOST:-}
 COMPANION_SSH_IDENTITY_FILE=${COMPANION_SSH_IDENTITY_FILE:-}
 COMPANION_DOCKER_ENDPOINT=${COMPANION_DOCKER_ENDPOINT:-}
+COMPANION_DOCKER_ENDPOINT_FALLBACKS=${COMPANION_DOCKER_ENDPOINT_FALLBACKS:-}
 
 INSTALL_HOMEBREW=${INSTALL_HOMEBREW:-0}
 WRITE_SHELL_PROFILE=${WRITE_SHELL_PROFILE:-0}
@@ -72,6 +75,7 @@ DEV_TUNNEL_LAUNCHD_PATH=${DEV_TUNNEL_LAUNCHD_PATH:-/opt/homebrew/bin:/usr/local/
 DEV_TUNNEL_DOCKER_CONFIG=${DEV_TUNNEL_DOCKER_CONFIG:-"$HOME/.docker"}
 DEV_TUNNEL_WATCH_INITIAL_SECONDS=${DEV_TUNNEL_WATCH_INITIAL_SECONDS:-5}
 DEV_TUNNEL_WATCH_MAX_SECONDS=${DEV_TUNNEL_WATCH_MAX_SECONDS:-60}
+DEV_TUNNEL_DOCKER_PROBE_TIMEOUT_SECONDS=${DEV_TUNNEL_DOCKER_PROBE_TIMEOUT_SECONDS:-5}
 
 export DOCKER_CONFIG="${DOCKER_CONFIG:-$DEV_TUNNEL_DOCKER_CONFIG}"
 
@@ -181,12 +185,21 @@ xml_escape() {
 }
 
 remote_target() {
-  require_var COMPANION_HOST
+  host=$(companion_ssh_host)
   if [ -n "$COMPANION_USER" ]; then
-    printf '%s@%s' "$COMPANION_USER" "$COMPANION_HOST"
+    printf '%s@%s' "$COMPANION_USER" "$host"
   else
-    printf '%s' "$COMPANION_HOST"
+    printf '%s' "$host"
   fi
+}
+
+companion_ssh_host() {
+  if [ -n "$COMPANION_SSH_HOST" ]; then
+    printf '%s' "$COMPANION_SSH_HOST"
+    return
+  fi
+  require_var COMPANION_HOST
+  printf '%s' "$COMPANION_HOST"
 }
 
 mac_formulae() {
@@ -275,6 +288,7 @@ write_managed_block() {
 
 configure_mac_ssh() {
   [ -n "$COMPANION_HOST" ] || return 0
+  ssh_host=$(companion_ssh_host)
   mkdir -p "$HOME/.ssh"
   chmod 700 "$HOME/.ssh"
   identity_line=""
@@ -287,7 +301,7 @@ configure_mac_ssh() {
   fi
   block=$(cat <<EOF
 Host $COMPANION_SSH_ALIAS
-  HostName $COMPANION_HOST
+  HostName $ssh_host
 $user_line
 $identity_line
   ControlMaster auto
@@ -652,24 +666,102 @@ cmd_companion_remote() {
   run ssh $SSH_TTY_FLAGS "$target" "chmod +x $remote_script &&$env_pairs sh $remote_script companion-local"
 }
 
-docker_endpoint() {
-  if [ -n "$COMPANION_DOCKER_ENDPOINT" ]; then
-    printf '%s' "$COMPANION_DOCKER_ENDPOINT"
-    return
-  fi
-  require_var COMPANION_HOST
+docker_endpoint_for_host() {
+  host=$1
   if [ -n "$COMPANION_SSH_ALIAS" ]; then
-    printf 'ssh://%s' "$COMPANION_SSH_ALIAS"
+    printf 'ssh://%s\n' "$COMPANION_SSH_ALIAS"
   elif [ -n "$COMPANION_USER" ]; then
-    printf 'ssh://%s@%s' "$COMPANION_USER" "$COMPANION_HOST"
+    printf 'ssh://%s@%s\n' "$COMPANION_USER" "$host"
   else
-    printf 'ssh://%s' "$COMPANION_HOST"
+    printf 'ssh://%s\n' "$host"
   fi
 }
 
-cmd_context() {
-  have docker || die "docker CLI is required"
-  endpoint=$(docker_endpoint)
+docker_endpoint_host_fallbacks() {
+  endpoint=$1
+  [ -n "$COMPANION_HOST_FALLBACKS" ] || return 0
+  case "$endpoint" in
+    *://*) ;;
+    *) return 0 ;;
+  esac
+
+  scheme=${endpoint%%://*}
+  rest=${endpoint#*://}
+  case "$rest" in
+    */*)
+      authority=${rest%%/*}
+      suffix="/${rest#*/}"
+      ;;
+    *)
+      authority=$rest
+      suffix=
+      ;;
+  esac
+
+  userinfo=
+  hostport=$authority
+  case "$hostport" in
+    *@*)
+      userinfo="${hostport%%@*}@"
+      hostport=${hostport#*@}
+      ;;
+  esac
+
+  # Keep the parser intentionally simple: host:port endpoints cover Docker TCP
+  # proxy and SSH fallbacks. Bracketed IPv6 can still use explicit endpoint
+  # fallbacks through COMPANION_DOCKER_ENDPOINT_FALLBACKS.
+  case "$hostport" in
+    \[*\]*) return 0 ;;
+  esac
+
+  case "$hostport" in
+    *:*)
+      host=${hostport%%:*}
+      port_part=${hostport#"$host"}
+      ;;
+    *)
+      host=$hostport
+      port_part=
+      ;;
+  esac
+
+  if [ -n "$COMPANION_HOST" ] && [ "$host" != "$COMPANION_HOST" ]; then
+    return 0
+  fi
+
+  for fallback_host in $COMPANION_HOST_FALLBACKS; do
+    printf '%s://%s%s%s%s\n' "$scheme" "$userinfo" "$fallback_host" "$port_part" "$suffix"
+  done
+}
+
+docker_endpoint_candidates() {
+  if [ -n "$COMPANION_DOCKER_ENDPOINT" ]; then
+    printf '%s\n' "$COMPANION_DOCKER_ENDPOINT"
+    docker_endpoint_host_fallbacks "$COMPANION_DOCKER_ENDPOINT"
+    if [ -n "$COMPANION_SSH_ALIAS" ] &&
+       [ "$COMPANION_DOCKER_ENDPOINT" != "ssh://$COMPANION_SSH_ALIAS" ]; then
+      printf 'ssh://%s\n' "$COMPANION_SSH_ALIAS"
+    fi
+    for endpoint in $COMPANION_DOCKER_ENDPOINT_FALLBACKS; do
+      printf '%s\n' "$endpoint"
+    done
+    return
+  fi
+  require_var COMPANION_HOST
+  docker_endpoint_for_host "$COMPANION_HOST"
+  if [ -z "$COMPANION_SSH_ALIAS" ]; then
+    for fallback_host in $COMPANION_HOST_FALLBACKS; do
+      docker_endpoint_for_host "$fallback_host"
+    done
+  fi
+}
+
+docker_endpoint() {
+  docker_endpoint_candidates | sed -n '1p'
+}
+
+update_docker_context_endpoint() {
+  endpoint=$1
   if docker context inspect "$DOCKER_CONTEXT_NAME" >/dev/null 2>&1; then
     run docker context update "$DOCKER_CONTEXT_NAME" \
       --description "ARM companion Docker host" \
@@ -682,6 +774,56 @@ cmd_context() {
   if [ "$USE_DOCKER_CONTEXT" = "1" ]; then
     run docker context use "$DOCKER_CONTEXT_NAME"
   fi
+}
+
+docker_endpoint_is_reachable() {
+  endpoint=$1
+  probe_err=$(mktemp)
+  timeout_bin=
+  if have gtimeout; then
+    timeout_bin=gtimeout
+  elif have timeout; then
+    timeout_bin=timeout
+  fi
+
+  if [ -n "$timeout_bin" ]; then
+    "$timeout_bin" "$DEV_TUNNEL_DOCKER_PROBE_TIMEOUT_SECONDS" docker --host "$endpoint" ps >/dev/null 2>"$probe_err"
+    probe_status=$?
+  else
+    docker --host "$endpoint" ps >/dev/null 2>"$probe_err"
+    probe_status=$?
+  fi
+
+  if [ "$probe_status" -eq 0 ]; then
+    rm -f "$probe_err"
+    return 0
+  fi
+  if [ "$probe_status" -eq 124 ]; then
+    log "docker endpoint probe timed out after ${DEV_TUNNEL_DOCKER_PROBE_TIMEOUT_SECONDS}s: $endpoint"
+  fi
+  if [ -s "$probe_err" ]; then
+    first_error=$(sed -n '1p' "$probe_err")
+    log "docker endpoint probe failed: $endpoint: $first_error"
+  fi
+  rm -f "$probe_err"
+  return 1
+}
+
+cmd_context() {
+  have docker || die "docker CLI is required"
+  endpoint=
+  for candidate_endpoint in $(docker_endpoint_candidates); do
+    if [ "$DRY_RUN" = "1" ] || docker_endpoint_is_reachable "$candidate_endpoint"; then
+      endpoint=$candidate_endpoint
+      break
+    fi
+    log "docker context endpoint is not reachable yet: $DOCKER_CONTEXT_NAME -> $candidate_endpoint"
+  done
+  if [ -z "$endpoint" ]; then
+    endpoint=$(docker_endpoint)
+    log "no Docker endpoint candidates are reachable; configuring primary endpoint anyway"
+  fi
+  update_docker_context_endpoint "$endpoint"
   if [ "$CREATE_BUILDX_BUILDER" = "1" ]; then
     builder=$BUILDX_BUILDER_NAME
     [ -n "$builder" ] || builder="$DOCKER_CONTEXT_NAME-builder"
@@ -697,29 +839,25 @@ cmd_context() {
 
 ensure_context_for_dev_tunnels() {
   have docker || die "docker CLI is required"
-  endpoint=$(docker_endpoint)
-  if docker context inspect "$DOCKER_CONTEXT_NAME" >/dev/null 2>&1; then
-    run docker context update "$DOCKER_CONTEXT_NAME" \
-      --description "ARM companion Docker host" \
-      --docker "host=$endpoint"
-  else
-    run docker context create "$DOCKER_CONTEXT_NAME" \
-      --description "ARM companion Docker host" \
-      --docker "host=$endpoint"
-  fi
-  if [ "$USE_DOCKER_CONTEXT" = "1" ]; then
-    run docker context use "$DOCKER_CONTEXT_NAME"
-  fi
-  if [ "$DRY_RUN" != "1" ]; then
-    if ! docker --context "$DOCKER_CONTEXT_NAME" ps >/dev/null; then
-      if [ "$DEV_TUNNEL_SOFT_FAIL" = "1" ]; then
-        log "docker context is not reachable yet: $DOCKER_CONTEXT_NAME"
-        return 1
-      fi
-      die "docker context is not reachable: $DOCKER_CONTEXT_NAME"
+  for endpoint in $(docker_endpoint_candidates); do
+    if [ "$DRY_RUN" = "1" ]; then
+      update_docker_context_endpoint "$endpoint"
+      log "docker context ready: $DOCKER_CONTEXT_NAME -> $endpoint"
+      return 0
     fi
+    if docker_endpoint_is_reachable "$endpoint"; then
+      update_docker_context_endpoint "$endpoint"
+      log "docker context ready: $DOCKER_CONTEXT_NAME -> $endpoint"
+      return 0
+    fi
+    log "docker context endpoint is not reachable yet: $DOCKER_CONTEXT_NAME -> $endpoint"
+  done
+
+  if [ "$DEV_TUNNEL_SOFT_FAIL" = "1" ]; then
+    log "docker context is not reachable yet: $DOCKER_CONTEXT_NAME"
+    return 1
   fi
-  log "docker context ready: $DOCKER_CONTEXT_NAME -> $endpoint"
+  die "docker context is not reachable: $DOCKER_CONTEXT_NAME"
 }
 
 dev_tunnel_ssh_target() {

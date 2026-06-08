@@ -58,6 +58,7 @@ Use `mac-dev-tunnels` to create or repair those forwards:
 ```sh
 DOCKER_CONTEXT_NAME=radxa \
 COMPANION_HOST=rock-5a.local \
+COMPANION_HOST_FALLBACKS="192.0.2.10" \
 COMPANION_USER=eduardo \
 COMPANION_SSH_ALIAS=radxa \
 COMPANION_DOCKER_ENDPOINT=tcp://rock-5a.local:23750 \
@@ -76,4 +77,12 @@ holding one of the Docker-published ports that need to point at the Radxa. By
 default it mirrors every published TCP host port from the configured Docker
 context onto Mac `127.0.0.1`. The launchd watcher retries from 5 seconds and
 exponentially backs off to a 60 second cap when the Radxa is temporarily
-unreachable.
+unreachable. Individual Docker endpoint probes are bounded to 5 seconds when
+`gtimeout`/`timeout` is available.
+
+If `rock-5a.local` is intermittently stale, set `COMPANION_HOST_FALLBACKS` to a
+direct IP or alternate hostname. The tunnel healer will try the mDNS Docker
+endpoint first and then equivalent fallback endpoints before giving up for that
+watch pass. When `COMPANION_SSH_ALIAS` is configured, it also tries the SSH
+Docker endpoint as a transport fallback after TCP endpoint candidates. Set
+`COMPANION_SSH_HOST` too when the generated SSH alias should use the direct IP.
