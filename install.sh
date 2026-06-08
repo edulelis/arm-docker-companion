@@ -59,6 +59,19 @@ USE_DOCKER_CONTEXT=${USE_DOCKER_CONTEXT:-1}
 DRY_RUN=${DRY_RUN:-0}
 SSH_TTY_FLAGS=${SSH_TTY_FLAGS:--t}
 
+DEV_TUNNEL_FORWARDS=${DEV_TUNNEL_FORWARDS:-}
+DEV_TUNNEL_AUTO_DOCKER_PORTS=${DEV_TUNNEL_AUTO_DOCKER_PORTS:-1}
+DEV_TUNNEL_PROJECT_ROOTS=${DEV_TUNNEL_PROJECT_ROOTS:-}
+DEV_TUNNEL_MANIFEST_NAME=${DEV_TUNNEL_MANIFEST_NAME:-.arm-docker-companion-tunnels}
+DEV_TUNNEL_STOP_COLIMA_CONFLICTS=${DEV_TUNNEL_STOP_COLIMA_CONFLICTS:-1}
+DEV_TUNNEL_SKIP_BUSY_PORTS=${DEV_TUNNEL_SKIP_BUSY_PORTS:-1}
+DEV_TUNNEL_SOFT_FAIL=${DEV_TUNNEL_SOFT_FAIL:-1}
+DEV_TUNNEL_LAUNCHD_LABEL=${DEV_TUNNEL_LAUNCHD_LABEL:-com.arm-docker-companion.dev-tunnels}
+DEV_TUNNEL_LOG_DIR=${DEV_TUNNEL_LOG_DIR:-"$HOME/Library/Logs"}
+DEV_TUNNEL_LAUNCHD_PATH=${DEV_TUNNEL_LAUNCHD_PATH:-/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin}
+DEV_TUNNEL_WATCH_INITIAL_SECONDS=${DEV_TUNNEL_WATCH_INITIAL_SECONDS:-5}
+DEV_TUNNEL_WATCH_MAX_SECONDS=${DEV_TUNNEL_WATCH_MAX_SECONDS:-60}
+
 usage() {
   cat <<'EOF'
 Usage:
@@ -67,6 +80,10 @@ Usage:
   ./install.sh companion-local
   ./install.sh mac-nfs-export
   ./install.sh context
+  ./install.sh mac-dev-tunnels
+  ./install.sh mac-dev-tunnels-watch
+  ./install.sh mac-dev-tunnels-agent-install
+  ./install.sh mac-dev-tunnels-agent-uninstall
   ./install.sh verify
   ./install.sh doctor
   ./install.sh all
@@ -80,6 +97,11 @@ Common flow from an ARM Mac:
   ./install.sh companion-remote
   ./install.sh context
   ./install.sh verify
+
+Self-healing localhost ports for Mac-side tools that expect companion-published
+container ports on localhost:
+  ./install.sh mac-dev-tunnels
+  ./install.sh mac-dev-tunnels-agent-install
 
 Set ENV_FILE=/path/to/file to load another config file.
 Set DRY_RUN=1 to print commands where supported.
@@ -149,6 +171,10 @@ json_escape() {
 
 shell_quote() {
   printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
+
+xml_escape() {
+  printf '%s' "$1" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g; s/"/\&quot;/g'
 }
 
 remote_target() {
@@ -666,6 +692,381 @@ cmd_context() {
   log "docker context ready: $DOCKER_CONTEXT_NAME -> $endpoint"
 }
 
+ensure_context_for_dev_tunnels() {
+  have docker || die "docker CLI is required"
+  endpoint=$(docker_endpoint)
+  if docker context inspect "$DOCKER_CONTEXT_NAME" >/dev/null 2>&1; then
+    run docker context update "$DOCKER_CONTEXT_NAME" \
+      --description "ARM companion Docker host" \
+      --docker "host=$endpoint"
+  else
+    run docker context create "$DOCKER_CONTEXT_NAME" \
+      --description "ARM companion Docker host" \
+      --docker "host=$endpoint"
+  fi
+  if [ "$USE_DOCKER_CONTEXT" = "1" ]; then
+    run docker context use "$DOCKER_CONTEXT_NAME"
+  fi
+  if [ "$DRY_RUN" != "1" ]; then
+    if ! docker --context "$DOCKER_CONTEXT_NAME" ps >/dev/null; then
+      if [ "$DEV_TUNNEL_SOFT_FAIL" = "1" ]; then
+        log "docker context is not reachable yet: $DOCKER_CONTEXT_NAME"
+        return 1
+      fi
+      die "docker context is not reachable: $DOCKER_CONTEXT_NAME"
+    fi
+  fi
+  log "docker context ready: $DOCKER_CONTEXT_NAME -> $endpoint"
+}
+
+dev_tunnel_ssh_target() {
+  if [ -n "$COMPANION_SSH_ALIAS" ]; then
+    printf '%s' "$COMPANION_SSH_ALIAS"
+  else
+    remote_target
+  fi
+}
+
+listener_pids_for_port() {
+  port=$1
+  lsof -nP -iTCP:"$port" -sTCP:LISTEN -Fp 2>/dev/null | sed -n 's/^p//p'
+}
+
+listener_commands_for_port() {
+  port=$1
+  listener_pids_for_port "$port" | while IFS= read -r pid; do
+    [ -n "$pid" ] || continue
+    ps -p "$pid" -o command= 2>/dev/null || true
+  done
+}
+
+port_has_colima_listener() {
+  port=$1
+  listener_commands_for_port "$port" | grep -E '(^|/| )colima( |$)|\.colima/|/lima/' >/dev/null 2>&1
+}
+
+port_has_ssh_listener() {
+  port=$1
+  listener_commands_for_port "$port" | grep -E '(^|/| )ssh( |:|$)' >/dev/null 2>&1
+}
+
+port_is_open() {
+  port=$1
+  nc -z 127.0.0.1 "$port" >/dev/null 2>&1
+}
+
+wait_for_port_to_free() {
+  port=$1
+  tries=0
+  while listener_pids_for_port "$port" | grep . >/dev/null 2>&1; do
+    tries=$((tries + 1))
+    [ "$tries" -le 20 ] || die "local port $port is still busy"
+    sleep 1
+  done
+}
+
+stop_colima_for_conflict_if_needed() {
+  port=$1
+  [ "$DEV_TUNNEL_STOP_COLIMA_CONFLICTS" = "1" ] || return 0
+  have colima || return 0
+  if port_has_colima_listener "$port"; then
+    log "stopping Colima because it owns requested local port $port"
+    run colima stop
+    [ "$DRY_RUN" = "1" ] && return 0
+    wait_for_port_to_free "$port"
+  fi
+}
+
+socket_path_for_forward() {
+  label=$1
+  local_port=$2
+  remote_host=$3
+  remote_port=$4
+  digest=$(printf '%s:%s:%s:%s' "$label" "$local_port" "$remote_host" "$remote_port" | cksum | awk '{print $1}')
+  printf '%s/.ssh/arm-companion-dev-%s.ctl' "$HOME" "$digest"
+}
+
+close_stale_tunnel_socket() {
+  socket=$1
+  target=$2
+  if [ -S "$socket" ]; then
+    ssh -S "$socket" -O exit "$target" >/dev/null 2>&1 || true
+  fi
+  rm -f "$socket"
+}
+
+normalize_forward_spec() {
+  spec=$1
+  case "$spec" in
+    *:*)
+      first=${spec%%:*}
+      rest=${spec#*:}
+      case "$rest" in
+        *:*)
+          second=${rest%%:*}
+          third=${rest#*:}
+          printf '%s %s %s\n' "$first" "$second" "$third"
+          ;;
+        *)
+          printf '%s 127.0.0.1 %s\n' "$first" "$rest"
+          ;;
+      esac
+      ;;
+    *)
+      printf '%s 127.0.0.1 %s\n' "$spec" "$spec"
+      ;;
+  esac
+}
+
+is_port_number() {
+  value=$1
+  case "$value" in
+    ''|*[!0-9]*) return 1 ;;
+    *) [ "$value" -gt 0 ] && [ "$value" -le 65535 ] ;;
+  esac
+}
+
+start_dev_forward() {
+  label=$1
+  spec=$2
+  normalized=$(normalize_forward_spec "$spec")
+  # shellcheck disable=SC2086
+  set -- $normalized
+  local_port=$1
+  remote_host=$2
+  remote_port=$3
+  is_port_number "$local_port" || die "invalid local port in tunnel spec: $spec"
+  is_port_number "$remote_port" || die "invalid remote port in tunnel spec: $spec"
+
+  target=$(dev_tunnel_ssh_target)
+  socket=$(socket_path_for_forward "$label" "$local_port" "$remote_host" "$remote_port")
+
+  mkdir -p "$HOME/.ssh"
+  chmod 700 "$HOME/.ssh"
+
+  if port_is_open "$local_port"; then
+    if port_has_colima_listener "$local_port"; then
+      stop_colima_for_conflict_if_needed "$local_port"
+    elif port_has_ssh_listener "$local_port"; then
+      log "localhost port already has an SSH listener for $label: $local_port"
+      return 0
+    elif [ "$DEV_TUNNEL_SKIP_BUSY_PORTS" = "1" ]; then
+      log "skipping busy localhost port for $label: $local_port"
+      return 0
+    else
+      die "localhost port is already busy for $label: $local_port"
+    fi
+  fi
+
+  if listener_pids_for_port "$local_port" | grep . >/dev/null 2>&1; then
+    stop_colima_for_conflict_if_needed "$local_port"
+  fi
+
+  if listener_pids_for_port "$local_port" | grep . >/dev/null 2>&1; then
+    if [ "$DEV_TUNNEL_SKIP_BUSY_PORTS" = "1" ]; then
+      log "skipping busy localhost port for $label: $local_port"
+      return 0
+    fi
+    die "cannot bind localhost port for $label: $local_port"
+  fi
+
+  close_stale_tunnel_socket "$socket" "$target"
+  log "opening localhost tunnel for $label: 127.0.0.1:$local_port -> $target:$remote_host:$remote_port"
+  run ssh -fN -M -S "$socket" \
+    -o ExitOnForwardFailure=yes \
+    -o ServerAliveInterval=15 \
+    -o ServerAliveCountMax=3 \
+    -L "127.0.0.1:$local_port:$remote_host:$remote_port" \
+    "$target"
+
+  [ "$DRY_RUN" = "1" ] && return 0
+  port_is_open "$local_port" || die "tunnel did not become reachable on localhost:$local_port"
+  log "localhost tunnel healthy for $label: $local_port"
+}
+
+start_forward_for_published_port() {
+  label=$1
+  port=$2
+  is_port_number "$port" || return 0
+  start_dev_forward "$label" "$port:127.0.0.1:$port"
+}
+
+start_forwards_for_docker_published_ports() {
+  [ "$DEV_TUNNEL_AUTO_DOCKER_PORTS" = "1" ] || return 0
+  have docker || die "docker CLI is required"
+  published_file=$(mktemp)
+  if ! docker --context "$DOCKER_CONTEXT_NAME" ps --format '{{.Names}}	{{.Ports}}' > "$published_file"; then
+    rm -f "$published_file"
+    if [ "$DEV_TUNNEL_SOFT_FAIL" = "1" ]; then
+      log "could not inspect published Docker ports; will retry later"
+      return 1
+    fi
+    die "could not inspect published Docker ports"
+  fi
+  while IFS='	' read -r container_name published_ports; do
+    [ -n "$published_ports" ] || continue
+    printf '%s\n' "$published_ports" | tr ',' '\n' | while IFS= read -r port_mapping; do
+      case "$port_mapping" in
+        *'->'*'/tcp'*)
+          port=$(printf '%s' "$port_mapping" | sed -n 's/.*:\([0-9][0-9]*\)->[0-9][0-9]*\/tcp.*/\1/p')
+          [ -n "$port" ] || continue
+          start_forward_for_published_port "$container_name" "$port"
+          ;;
+      esac
+    done
+  done < "$published_file"
+  rm -f "$published_file"
+}
+
+project_manifest_label() {
+  project_root=$1
+  basename "$project_root"
+}
+
+forward_specs_from_project_manifest() {
+  project_root=$1
+  [ -d "$project_root" ] || return 0
+  manifest="$project_root/$DEV_TUNNEL_MANIFEST_NAME"
+  [ -f "$manifest" ] || return 0
+  label=$(project_manifest_label "$project_root")
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      ''|\#*) continue ;;
+    esac
+    start_dev_forward "$label" "$line"
+  done < "$manifest"
+}
+
+run_mac_dev_tunnels_once() {
+  [ "$(uname -s)" = "Darwin" ] || die "mac-dev-tunnels must run on macOS"
+  have ssh || die "ssh is required"
+  have lsof || die "lsof is required"
+  have nc || die "nc is required"
+  if ! ensure_context_for_dev_tunnels; then
+    return 1
+  fi
+
+  found=0
+  if [ "$DEV_TUNNEL_AUTO_DOCKER_PORTS" = "1" ]; then
+    found=1
+    start_forwards_for_docker_published_ports || return 1
+  fi
+
+  for spec in $DEV_TUNNEL_FORWARDS; do
+    found=1
+    start_dev_forward "env" "$spec"
+  done
+
+  if [ -n "$DEV_TUNNEL_PROJECT_ROOTS" ]; then
+    for project_root in $DEV_TUNNEL_PROJECT_ROOTS; do
+      found=1
+      forward_specs_from_project_manifest "$project_root"
+    done
+  fi
+
+  [ "$found" = "1" ] || die "no dev tunnel forwards configured"
+}
+
+cmd_mac_dev_tunnels() {
+  if ! run_mac_dev_tunnels_once; then
+    [ "$DEV_TUNNEL_SOFT_FAIL" = "1" ] && return 0
+    die "dev tunnel reconciliation failed"
+  fi
+}
+
+cmd_mac_dev_tunnels_watch() {
+  delay=$DEV_TUNNEL_WATCH_INITIAL_SECONDS
+  max_delay=$DEV_TUNNEL_WATCH_MAX_SECONDS
+  is_port_number "$delay" || die "DEV_TUNNEL_WATCH_INITIAL_SECONDS must be a positive integer"
+  is_port_number "$max_delay" || die "DEV_TUNNEL_WATCH_MAX_SECONDS must be a positive integer"
+
+  while :; do
+    if run_mac_dev_tunnels_once; then
+      delay=$DEV_TUNNEL_WATCH_INITIAL_SECONDS
+    else
+      log "dev tunnel reconciliation failed; retrying in ${delay}s"
+    fi
+
+    sleep "$delay"
+    if [ "$delay" -lt "$max_delay" ]; then
+      delay=$((delay * 2))
+      [ "$delay" -le "$max_delay" ] || delay=$max_delay
+    fi
+  done
+}
+
+cmd_mac_dev_tunnels_agent_install() {
+  [ "$(uname -s)" = "Darwin" ] || die "mac-dev-tunnels-agent-install must run on macOS"
+  plist_dir="$HOME/Library/LaunchAgents"
+  plist="$plist_dir/$DEV_TUNNEL_LAUNCHD_LABEL.plist"
+  mkdir -p "$plist_dir" "$DEV_TUNNEL_LOG_DIR"
+  script_path=$(xml_escape "$SCRIPT_DIR/install.sh")
+  env_path=$(xml_escape "$ENV_FILE")
+  stdout_path=$(xml_escape "$DEV_TUNNEL_LOG_DIR/$DEV_TUNNEL_LAUNCHD_LABEL.out.log")
+  stderr_path=$(xml_escape "$DEV_TUNNEL_LOG_DIR/$DEV_TUNNEL_LAUNCHD_LABEL.err.log")
+  label_xml=$(xml_escape "$DEV_TUNNEL_LAUNCHD_LABEL")
+  launchd_path=$(xml_escape "$DEV_TUNNEL_LAUNCHD_PATH")
+
+  tmp=$(mktemp)
+  cat > "$tmp" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>$label_xml</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/sh</string>
+    <string>$script_path</string>
+    <string>mac-dev-tunnels-watch</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>ENV_FILE</key>
+    <string>$env_path</string>
+    <key>PATH</key>
+    <string>$launchd_path</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>$stdout_path</string>
+  <key>StandardErrorPath</key>
+  <string>$stderr_path</string>
+</dict>
+</plist>
+EOF
+
+  if [ "$DRY_RUN" = "1" ]; then
+    log "would install launchd agent $plist"
+    sed 's/^/  /' "$tmp"
+    rm -f "$tmp"
+    return
+  fi
+
+  install -m 0644 "$tmp" "$plist"
+  rm -f "$tmp"
+  launchctl bootout "gui/$(id -u)" "$plist" >/dev/null 2>&1 || true
+  launchctl bootstrap "gui/$(id -u)" "$plist"
+  launchctl kickstart -k "gui/$(id -u)/$DEV_TUNNEL_LAUNCHD_LABEL" || true
+  log "launchd agent installed: $plist"
+}
+
+cmd_mac_dev_tunnels_agent_uninstall() {
+  [ "$(uname -s)" = "Darwin" ] || die "mac-dev-tunnels-agent-uninstall must run on macOS"
+  plist="$HOME/Library/LaunchAgents/$DEV_TUNNEL_LAUNCHD_LABEL.plist"
+  if [ "$DRY_RUN" = "1" ]; then
+    log "would uninstall launchd agent $plist"
+    return
+  fi
+  launchctl bootout "gui/$(id -u)" "$plist" >/dev/null 2>&1 || true
+  rm -f "$plist"
+  log "launchd agent uninstalled: $plist"
+}
+
 cmd_verify() {
   have docker || die "docker CLI is required"
   ctx=${VERIFY_CONTEXT:-$DOCKER_CONTEXT_NAME}
@@ -711,6 +1112,10 @@ case "$command_name" in
   companion-local) cmd_companion_local ;;
   mac-nfs-export) cmd_mac_nfs_export ;;
   context) cmd_context ;;
+  mac-dev-tunnels) cmd_mac_dev_tunnels ;;
+  mac-dev-tunnels-watch) cmd_mac_dev_tunnels_watch ;;
+  mac-dev-tunnels-agent-install) cmd_mac_dev_tunnels_agent_install ;;
+  mac-dev-tunnels-agent-uninstall) cmd_mac_dev_tunnels_agent_uninstall ;;
   verify) cmd_verify ;;
   doctor) cmd_doctor ;;
   all) cmd_all ;;

@@ -47,3 +47,33 @@ COMPANION_DOCKER_DATA_ROOT=/mnt/companion-ssd/docker
 
 The installer never formats disks.
 
+## Mac Localhost Tunnels
+
+On a Radxa used as a Docker companion, Docker-published ports are bound on the
+Radxa. Tools running on the Mac that use `localhost` still need Mac-side
+forwards.
+
+Use `mac-dev-tunnels` to create or repair those forwards:
+
+```sh
+DOCKER_CONTEXT_NAME=radxa \
+COMPANION_HOST=rock-5a.local \
+COMPANION_USER=eduardo \
+COMPANION_SSH_ALIAS=radxa \
+COMPANION_DOCKER_ENDPOINT=tcp://rock-5a.local:23750 \
+./install.sh mac-dev-tunnels
+```
+
+Install the launchd healer when the Radxa should remain the default even after
+sleep, network changes, or Colima fallback usage:
+
+```sh
+./install.sh mac-dev-tunnels-agent-install
+```
+
+The healer is conservative: it only stops Colima when Colima is the process
+holding one of the Docker-published ports that need to point at the Radxa. By
+default it mirrors every published TCP host port from the configured Docker
+context onto Mac `127.0.0.1`. The launchd watcher retries from 5 seconds and
+exponentially backs off to a 60 second cap when the Radxa is temporarily
+unreachable.

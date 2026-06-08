@@ -49,6 +49,50 @@ journalctl -u arm-companion-nfs-remount.service
 tail -n 100 /var/log/arm-companion-nfs-remount.log
 ```
 
+## Docker Context Works But Localhost Ports Fail
+
+Some local tools use `localhost` ports even when Docker itself runs on the
+companion. A Docker context only points the Docker CLI at the companion; it does
+not make published container ports on the companion automatically appear on Mac
+`localhost`.
+
+Use the Mac dev tunnel healer:
+
+```sh
+DOCKER_CONTEXT_NAME=radxa \
+COMPANION_HOST=rock-5a.local \
+COMPANION_USER=eduardo \
+COMPANION_SSH_ALIAS=radxa \
+COMPANION_DOCKER_ENDPOINT=tcp://rock-5a.local:23750 \
+./install.sh mac-dev-tunnels
+```
+
+For a persistent self-healing background check:
+
+```sh
+./install.sh mac-dev-tunnels-agent-install
+```
+
+By default the healer reads `docker --context "$DOCKER_CONTEXT_NAME" ps`,
+mirrors every published TCP host port onto Mac `127.0.0.1`, stops Colima only
+when Colima owns one of those ports, and repairs broken SSH forwards on the next
+watch pass. The launchd watcher starts retrying after 5 seconds, exponentially
+backs off on failures, and caps retries at 60 seconds by default.
+
+Extra non-Docker forwards can be declared with `DEV_TUNNEL_FORWARDS`:
+
+```sh
+DEV_TUNNEL_FORWARDS="8080:127.0.0.1:8080 9000:service-name:9000"
+```
+
+Inspect:
+
+```sh
+lsof -nP -iTCP:<port> -sTCP:LISTEN
+launchctl print gui/$(id -u)/com.arm-docker-companion.dev-tunnels
+tail -n 100 ~/Library/Logs/com.arm-docker-companion.dev-tunnels.err.log
+```
+
 ## Docker Data Is On The Wrong Disk
 
 Check:
@@ -59,4 +103,3 @@ findmnt /mnt/companion-ssd
 ```
 
 Update `.env`, rerun `companion-remote`, and restart Docker.
-

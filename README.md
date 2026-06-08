@@ -79,6 +79,8 @@ On macOS ARM64:
 - Optional SSH config block with ControlMaster, ControlPersist, and keepalives.
 - Optional shell profile exports for BuildKit.
 - Optional macOS NFS export for a project checkout.
+- Optional self-healing macOS localhost tunnels that mirror companion-published
+  Docker ports for tools that still connect to `localhost`.
 
 On ARM Linux companion:
 
@@ -170,6 +172,9 @@ Run:
 ./install.sh companion-local    # run directly on the ARM Linux host
 ./install.sh mac-nfs-export     # add a macOS /etc/exports entry and restart nfsd
 ./install.sh context            # create/update Docker context
+./install.sh mac-dev-tunnels    # heal localhost tunnels to companion-published Docker ports
+./install.sh mac-dev-tunnels-agent-install    # run the self-healing launchd watcher
+./install.sh mac-dev-tunnels-agent-uninstall  # remove the launchd tunnel healer
 ./install.sh verify             # run Docker/Compose smoke checks
 ./install.sh doctor             # print local and remote diagnostic info
 ./install.sh all                # mac + companion-remote + context + verify
