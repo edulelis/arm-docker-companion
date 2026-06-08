@@ -69,8 +69,11 @@ DEV_TUNNEL_SOFT_FAIL=${DEV_TUNNEL_SOFT_FAIL:-1}
 DEV_TUNNEL_LAUNCHD_LABEL=${DEV_TUNNEL_LAUNCHD_LABEL:-com.arm-docker-companion.dev-tunnels}
 DEV_TUNNEL_LOG_DIR=${DEV_TUNNEL_LOG_DIR:-"$HOME/Library/Logs"}
 DEV_TUNNEL_LAUNCHD_PATH=${DEV_TUNNEL_LAUNCHD_PATH:-/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin}
+DEV_TUNNEL_DOCKER_CONFIG=${DEV_TUNNEL_DOCKER_CONFIG:-"$HOME/.docker"}
 DEV_TUNNEL_WATCH_INITIAL_SECONDS=${DEV_TUNNEL_WATCH_INITIAL_SECONDS:-5}
 DEV_TUNNEL_WATCH_MAX_SECONDS=${DEV_TUNNEL_WATCH_MAX_SECONDS:-60}
+
+export DOCKER_CONFIG="${DOCKER_CONFIG:-$DEV_TUNNEL_DOCKER_CONFIG}"
 
 usage() {
   cat <<'EOF'
@@ -1006,6 +1009,8 @@ cmd_mac_dev_tunnels_agent_install() {
   stderr_path=$(xml_escape "$DEV_TUNNEL_LOG_DIR/$DEV_TUNNEL_LAUNCHD_LABEL.err.log")
   label_xml=$(xml_escape "$DEV_TUNNEL_LAUNCHD_LABEL")
   launchd_path=$(xml_escape "$DEV_TUNNEL_LAUNCHD_PATH")
+  launchd_home=$(xml_escape "$HOME")
+  docker_config=$(xml_escape "$DEV_TUNNEL_DOCKER_CONFIG")
 
   tmp=$(mktemp)
   cat > "$tmp" <<EOF
@@ -1027,6 +1032,10 @@ cmd_mac_dev_tunnels_agent_install() {
     <string>$env_path</string>
     <key>PATH</key>
     <string>$launchd_path</string>
+    <key>HOME</key>
+    <string>$launchd_home</string>
+    <key>DOCKER_CONFIG</key>
+    <string>$docker_config</string>
   </dict>
   <key>RunAtLoad</key>
   <true/>
