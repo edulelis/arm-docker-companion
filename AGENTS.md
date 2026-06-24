@@ -20,6 +20,7 @@ Ask for or infer these before setup:
 - `DOCKER_CONTEXT_NAME`: desired local Docker context name, usually `arm-companion`.
 - Optional `COMPANION_SSH_IDENTITY_FILE`: SSH key path if the default SSH agent is not enough.
 - Optional storage UUID and mount point if Docker data should live on SSD/NVMe.
+- Optional USB storage bridge vendor/product IDs if USB autosuspend hardening or USB recovery should be configured.
 - Optional NFS export/mount paths if containers need direct access to a Mac checkout.
 
 ## Basic Agent Flow
@@ -89,6 +90,7 @@ COMPANION_STORAGE_UUID=your-filesystem-uuid
 COMPANION_STORAGE_MOUNT=/mnt/companion-ssd
 CONFIGURE_DOCKER_DAEMON=1
 COMPANION_DOCKER_DATA_ROOT=/mnt/companion-ssd/docker
+ENABLE_DOCKER_STORAGE_GUARD=1
 ```
 
 Confirm the disk exists first:
@@ -98,6 +100,9 @@ ssh "$COMPANION_USER@$COMPANION_HOST" 'lsblk -f'
 ```
 
 Do not create filesystems or change partitions unless explicitly requested.
+For flaky USB SSD bridges, add `ENABLE_USB_STORAGE_POWER_POLICY=1` and bridge
+IDs from `lsusb`; use `ENABLE_USB_STORAGE_RECOVERY_REBOOT=1` only when the
+human accepts a rate-limited companion reboot after USB enumeration failures.
 
 ## Optional NFS Path
 
@@ -137,4 +142,3 @@ Common fixes:
 - New Docker group membership needs a fresh SSH login.
 - mDNS resolving to the wrong interface may need `ENABLE_AVAHI_FIX=1`.
 - Slow or stale bind mounts may need the NFS remount watchdog or a local checkout on the companion.
-

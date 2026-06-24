@@ -37,6 +37,14 @@ DOCKER_APT_SUITE=${DOCKER_APT_SUITE:-}
 COMPANION_DOCKER_DATA_ROOT=${COMPANION_DOCKER_DATA_ROOT:-/var/lib/docker}
 DOCKER_LOG_MAX_SIZE=${DOCKER_LOG_MAX_SIZE:-100m}
 DOCKER_LOG_MAX_FILE=${DOCKER_LOG_MAX_FILE:-3}
+ENABLE_DOCKER_STORAGE_GUARD=${ENABLE_DOCKER_STORAGE_GUARD:-0}
+DOCKER_STORAGE_GUARD_INTERVAL_SECONDS=${DOCKER_STORAGE_GUARD_INTERVAL_SECONDS:-15}
+ENABLE_USB_STORAGE_POWER_POLICY=${ENABLE_USB_STORAGE_POWER_POLICY:-0}
+USB_STORAGE_BRIDGE_VENDOR_ID=${USB_STORAGE_BRIDGE_VENDOR_ID:-}
+USB_STORAGE_BRIDGE_PRODUCT_ID=${USB_STORAGE_BRIDGE_PRODUCT_ID:-}
+ENABLE_USB_STORAGE_RECOVERY_REBOOT=${ENABLE_USB_STORAGE_RECOVERY_REBOOT:-0}
+USB_STORAGE_RECOVERY_MIN_UPTIME_SECONDS=${USB_STORAGE_RECOVERY_MIN_UPTIME_SECONDS:-180}
+USB_STORAGE_RECOVERY_REBOOT_COOLDOWN_SECONDS=${USB_STORAGE_RECOVERY_REBOOT_COOLDOWN_SECONDS:-21600}
 
 CONFIGURE_STORAGE_MOUNT=${CONFIGURE_STORAGE_MOUNT:-0}
 COMPANION_STORAGE_UUID=${COMPANION_STORAGE_UUID:-}
@@ -50,6 +58,9 @@ ENABLE_NFS_CLIENT=${ENABLE_NFS_CLIENT:-0}
 NFS_SERVER=${NFS_SERVER:-}
 NFS_EXPORT=${NFS_EXPORT:-}
 NFS_MOUNT=${NFS_MOUNT:-}
+NFS_MOUNT_OPTIONS=${NFS_MOUNT_OPTIONS:-}
+NFS_RECONCILE_MODE=${NFS_RECONCILE_MODE:-automount}
+NFS_RECONCILE_INTERVAL_SECONDS=${NFS_RECONCILE_INTERVAL_SECONDS:-10}
 
 ENABLE_LAN_DOCKER_PROXY=${ENABLE_LAN_DOCKER_PROXY:-0}
 DOCKER_PROXY_BIND=${DOCKER_PROXY_BIND:-0.0.0.0}
@@ -76,6 +87,7 @@ DEV_TUNNEL_DOCKER_CONFIG=${DEV_TUNNEL_DOCKER_CONFIG:-"$HOME/.docker"}
 DEV_TUNNEL_WATCH_INITIAL_SECONDS=${DEV_TUNNEL_WATCH_INITIAL_SECONDS:-5}
 DEV_TUNNEL_WATCH_MAX_SECONDS=${DEV_TUNNEL_WATCH_MAX_SECONDS:-60}
 DEV_TUNNEL_DOCKER_PROBE_TIMEOUT_SECONDS=${DEV_TUNNEL_DOCKER_PROBE_TIMEOUT_SECONDS:-5}
+DEV_TUNNEL_ACTIVE_DOCKER_ENDPOINT=
 
 export DOCKER_CONFIG="${DOCKER_CONFIG:-$DEV_TUNNEL_DOCKER_CONFIG}"
 
@@ -500,6 +512,326 @@ EOF
   as_root systemctl restart docker
 }
 
+configure_usb_storage_power_policy() {
+  case "$ENABLE_USB_STORAGE_POWER_POLICY" in
+    0|1) ;;
+    *) die "ENABLE_USB_STORAGE_POWER_POLICY must be 0 or 1" ;;
+  esac
+  [ "$ENABLE_USB_STORAGE_POWER_POLICY" = "1" ] || return 0
+  if { [ -n "$USB_STORAGE_BRIDGE_VENDOR_ID" ] && [ -z "$USB_STORAGE_BRIDGE_PRODUCT_ID" ]; } ||
+     { [ -z "$USB_STORAGE_BRIDGE_VENDOR_ID" ] && [ -n "$USB_STORAGE_BRIDGE_PRODUCT_ID" ]; }; then
+    die "USB_STORAGE_BRIDGE_VENDOR_ID and USB_STORAGE_BRIDGE_PRODUCT_ID must be set together"
+  fi
+
+  install_root_file /usr/local/bin/arm-companion-usb-power-apply.sh 0755 <<'EOF'
+#!/bin/sh
+set -eu
+
+mode=${1:-apply}
+
+apply_power_policy() {
+  if [ -w /sys/module/usbcore/parameters/autosuspend ]; then
+    echo -1 >/sys/module/usbcore/parameters/autosuspend || true
+  fi
+
+  for dev in /sys/bus/usb/devices/*; do
+    [ -d "$dev" ] || continue
+    if [ -w "$dev/power/control" ]; then
+      echo on >"$dev/power/control" || true
+    fi
+    if [ -w "$dev/power/autosuspend" ]; then
+      echo -1 >"$dev/power/autosuspend" || true
+    fi
+  done
+}
+
+status() {
+  printf 'usbcore.autosuspend=%s\n' "$(cat /sys/module/usbcore/parameters/autosuspend 2>/dev/null || echo missing)"
+  for dev in /sys/bus/usb/devices/*; do
+    [ -f "$dev/idVendor" ] || continue
+    printf '%s vendor=%s product=%s power=%s autosuspend=%s\n' \
+      "$(basename "$dev")" \
+      "$(cat "$dev/idVendor" 2>/dev/null)" \
+      "$(cat "$dev/idProduct" 2>/dev/null)" \
+      "$(cat "$dev/power/control" 2>/dev/null || echo missing)" \
+      "$(cat "$dev/power/autosuspend" 2>/dev/null || echo missing)"
+  done
+}
+
+case "$mode" in
+  apply|--apply)
+    apply_power_policy
+    status
+    ;;
+  status|--status)
+    status
+    ;;
+  *)
+    echo "usage: $0 [apply|status]" >&2
+    exit 64
+    ;;
+esac
+EOF
+
+  install_root_file /etc/systemd/system/arm-companion-usb-power.service 0644 <<'EOF'
+[Unit]
+Description=Disable USB autosuspend for ARM companion storage reliability
+After=systemd-udevd.service local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/arm-companion-usb-power-apply.sh apply
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  install_root_file /etc/udev/rules.d/99-arm-companion-usb-power.rules 0644 <<'EOF'
+ACTION=="add|change", SUBSYSTEM=="usb", TEST=="power/control", ATTR{power/control}="on"
+ACTION=="add|change", SUBSYSTEM=="usb", TEST=="power/autosuspend", ATTR{power/autosuspend}="-1"
+EOF
+
+  if [ -n "$USB_STORAGE_BRIDGE_VENDOR_ID" ] && [ -n "$USB_STORAGE_BRIDGE_PRODUCT_ID" ]; then
+    if [ "$ENABLE_DOCKER_STORAGE_GUARD" = "1" ]; then
+      install_root_file /etc/udev/rules.d/99-arm-companion-usb-storage.rules 0644 <<EOF
+ACTION=="add|change", SUBSYSTEM=="usb", ATTR{idVendor}=="$USB_STORAGE_BRIDGE_VENDOR_ID", ATTR{idProduct}=="$USB_STORAGE_BRIDGE_PRODUCT_ID", TEST=="power/control", ATTR{power/control}="on"
+ACTION=="add|change", SUBSYSTEM=="usb", ATTR{idVendor}=="$USB_STORAGE_BRIDGE_VENDOR_ID", ATTR{idProduct}=="$USB_STORAGE_BRIDGE_PRODUCT_ID", TEST=="power/autosuspend", ATTR{power/autosuspend}="-1"
+ACTION=="add|remove|change", SUBSYSTEM=="usb", ATTR{idVendor}=="$USB_STORAGE_BRIDGE_VENDOR_ID", ATTR{idProduct}=="$USB_STORAGE_BRIDGE_PRODUCT_ID", TAG+="systemd", ENV{SYSTEMD_WANTS}+="arm-companion-docker-storage-reconcile.service"
+EOF
+    else
+      install_root_file /etc/udev/rules.d/99-arm-companion-usb-storage.rules 0644 <<EOF
+ACTION=="add|change", SUBSYSTEM=="usb", ATTR{idVendor}=="$USB_STORAGE_BRIDGE_VENDOR_ID", ATTR{idProduct}=="$USB_STORAGE_BRIDGE_PRODUCT_ID", TEST=="power/control", ATTR{power/control}="on"
+ACTION=="add|change", SUBSYSTEM=="usb", ATTR{idVendor}=="$USB_STORAGE_BRIDGE_VENDOR_ID", ATTR{idProduct}=="$USB_STORAGE_BRIDGE_PRODUCT_ID", TEST=="power/autosuspend", ATTR{power/autosuspend}="-1"
+EOF
+    fi
+  fi
+
+  as_root systemctl daemon-reload
+  as_root udevadm control --reload
+  as_root udevadm trigger --subsystem-match=usb || true
+  as_root systemctl enable --now arm-companion-usb-power.service
+  as_root systemctl start arm-companion-usb-power.service || true
+}
+
+configure_docker_storage_guard() {
+  [ "$ENABLE_DOCKER_STORAGE_GUARD" = "1" ] || return 0
+  require_var COMPANION_STORAGE_UUID
+  require_var COMPANION_STORAGE_MOUNT
+  require_var COMPANION_DOCKER_DATA_ROOT
+
+  storage_uuid_q=$(shell_quote "$COMPANION_STORAGE_UUID")
+  storage_mount_q=$(shell_quote "$COMPANION_STORAGE_MOUNT")
+  docker_root_q=$(shell_quote "$COMPANION_DOCKER_DATA_ROOT")
+  usb_recovery_reboot_q=$(shell_quote "$ENABLE_USB_STORAGE_RECOVERY_REBOOT")
+  usb_recovery_min_uptime_q=$(shell_quote "$USB_STORAGE_RECOVERY_MIN_UPTIME_SECONDS")
+  usb_recovery_cooldown_q=$(shell_quote "$USB_STORAGE_RECOVERY_REBOOT_COOLDOWN_SECONDS")
+
+  case "$ENABLE_USB_STORAGE_RECOVERY_REBOOT" in
+    0|1) ;;
+    *) die "ENABLE_USB_STORAGE_RECOVERY_REBOOT must be 0 or 1" ;;
+  esac
+  case "$USB_STORAGE_RECOVERY_MIN_UPTIME_SECONDS" in
+    ''|*[!0-9]*) die "USB_STORAGE_RECOVERY_MIN_UPTIME_SECONDS must be a non-negative integer" ;;
+  esac
+  case "$USB_STORAGE_RECOVERY_REBOOT_COOLDOWN_SECONDS" in
+    ''|*[!0-9]*) die "USB_STORAGE_RECOVERY_REBOOT_COOLDOWN_SECONDS must be a non-negative integer" ;;
+  esac
+
+  as_root mkdir -p "$COMPANION_STORAGE_MOUNT" "$COMPANION_DOCKER_DATA_ROOT" /etc/systemd/system/docker.service.d
+
+  install_root_file /usr/local/bin/arm-companion-docker-storage-guard.sh 0755 <<EOF
+#!/bin/sh
+set -eu
+
+mode=\${1:-pre-start}
+expected_uuid=$storage_uuid_q
+storage_mount=$storage_mount_q
+docker_root=$docker_root_q
+enable_usb_recovery_reboot=$usb_recovery_reboot_q
+usb_recovery_min_uptime_seconds=$usb_recovery_min_uptime_q
+usb_recovery_reboot_cooldown_seconds=$usb_recovery_cooldown_q
+state_dir=/var/lib/arm-docker-companion
+usb_recovery_reboot_mark=\$state_dir/usb-storage-reboot
+
+device_present() {
+  [ -e "/dev/disk/by-uuid/\$expected_uuid" ]
+}
+
+storage_mount_unit() {
+  systemd-escape --path --suffix=mount "\$storage_mount"
+}
+
+mounted_uuid_ok() {
+  if ! findmnt -rn -T "\$storage_mount" >/dev/null 2>&1; then
+    return 1
+  fi
+  source_device=\$(findmnt -rn -o SOURCE -T "\$storage_mount" 2>/dev/null || true)
+  actual_uuid=\$(blkid -s UUID -o value "\$source_device" 2>/dev/null || true)
+  [ -n "\$actual_uuid" ] && [ "\$actual_uuid" = "\$expected_uuid" ]
+}
+
+ensure_storage_mount() {
+  mkdir -p "\$storage_mount"
+  if mounted_uuid_ok; then
+    return 0
+  fi
+  if findmnt -rn -T "\$storage_mount" >/dev/null 2>&1; then
+    umount -lf "\$storage_mount" >/dev/null 2>&1 || true
+  fi
+  unit=\$(storage_mount_unit)
+  systemctl start "\$unit" >/dev/null 2>&1 || mount "\$storage_mount" >/dev/null 2>&1 || true
+  mounted_uuid_ok
+}
+
+docker_root_ok() {
+  mkdir -p "\$docker_root"
+  if ! findmnt -rn -T "\$docker_root" >/dev/null 2>&1; then
+    return 1
+  fi
+  source_device=\$(findmnt -rn -o SOURCE -T "\$docker_root" 2>/dev/null || true)
+  actual_uuid=\$(blkid -s UUID -o value "\$source_device" 2>/dev/null || true)
+  [ -n "\$actual_uuid" ] && [ "\$actual_uuid" = "\$expected_uuid" ]
+}
+
+uptime_seconds() {
+  awk '{print int(\$1)}' /proc/uptime 2>/dev/null || echo 0
+}
+
+recent_usb_enumeration_failure() {
+  journalctl -k -b --since "10 minutes ago" --no-pager 2>/dev/null |
+    grep -Eq 'usb (usb[0-9]+-port[0-9]+|[0-9]+-[0-9]+):.*(Cannot enable|device descriptor read|not accepting address|unable to enumerate)'
+}
+
+maybe_reboot_for_usb_storage() {
+  [ "\$enable_usb_recovery_reboot" = "1" ] || return 0
+
+  uptime=\$(uptime_seconds)
+  if [ "\$uptime" -lt "\$usb_recovery_min_uptime_seconds" ]; then
+    echo "arm-docker-companion: storage absent; deferring USB recovery reboot until uptime exceeds \${usb_recovery_min_uptime_seconds}s" >&2
+    return 0
+  fi
+
+  if ! recent_usb_enumeration_failure; then
+    return 0
+  fi
+
+  now=\$(date +%s)
+  last=0
+  if [ -r "\$usb_recovery_reboot_mark" ]; then
+    last=\$(cat "\$usb_recovery_reboot_mark" 2>/dev/null || echo 0)
+  fi
+  case "\$last" in
+    ''|*[!0-9]*) last=0 ;;
+  esac
+
+  if [ \$((now - last)) -lt "\$usb_recovery_reboot_cooldown_seconds" ]; then
+    echo "arm-docker-companion: storage absent with USB enumeration failures; reboot already attempted within cooldown" >&2
+    return 0
+  fi
+
+  mkdir -p "\$state_dir"
+  printf '%s\n' "\$now" >"\$usb_recovery_reboot_mark"
+  sync
+  echo "arm-docker-companion: storage absent with USB enumeration failures; rebooting to recover USB storage" >&2
+  systemctl reboot --no-wall >/dev/null 2>&1 || shutdown -r now >/dev/null 2>&1 || true
+}
+
+pre_start() {
+  if ! device_present; then
+    echo "arm-docker-companion: storage UUID \$expected_uuid is absent; refusing Docker start" >&2
+    return 42
+  fi
+  if ! ensure_storage_mount; then
+    echo "arm-docker-companion: \$storage_mount is not mounted from UUID \$expected_uuid" >&2
+    return 43
+  fi
+  if ! docker_root_ok; then
+    echo "arm-docker-companion: \$docker_root is not on the expected storage device" >&2
+    return 44
+  fi
+}
+
+reconcile() {
+  if device_present && ensure_storage_mount && docker_root_ok; then
+    systemctl start docker.service >/dev/null 2>&1 || true
+    exit 0
+  fi
+
+  systemctl stop docker.service >/dev/null 2>&1 || true
+  if ! device_present; then
+    maybe_reboot_for_usb_storage
+  fi
+  exit 0
+}
+
+status() {
+  echo "storage_uuid=\$expected_uuid"
+  echo "device_present=\$(device_present && echo yes || echo no)"
+  echo "storage_mount=\$(findmnt -rn -o SOURCE,TARGET,OPTIONS -T "\$storage_mount" 2>/dev/null || echo missing)"
+  echo "docker_root=\$(findmnt -rn -o SOURCE,TARGET,OPTIONS -T "\$docker_root" 2>/dev/null || echo missing)"
+  echo "usb_recovery_reboot=\$enable_usb_recovery_reboot"
+  echo "usb_recovery_reboot_last=\$(cat "\$usb_recovery_reboot_mark" 2>/dev/null || echo never)"
+}
+
+case "\$mode" in
+  pre-start|--pre-start)
+    pre_start
+    ;;
+  reconcile|--reconcile)
+    reconcile
+    ;;
+  status|--status)
+    status
+    ;;
+  *)
+    echo "usage: \$0 [pre-start|reconcile|status]" >&2
+    exit 64
+    ;;
+esac
+EOF
+
+  install_root_file /etc/systemd/system/docker.service.d/arm-companion-storage-guard.conf 0644 <<EOF
+[Unit]
+After=local-fs.target
+RequiresMountsFor=$COMPANION_STORAGE_MOUNT $COMPANION_DOCKER_DATA_ROOT
+
+[Service]
+ExecStartPre=/usr/local/bin/arm-companion-docker-storage-guard.sh pre-start
+Restart=on-failure
+RestartSec=5
+StartLimitIntervalSec=0
+EOF
+
+  install_root_file /etc/systemd/system/arm-companion-docker-storage-reconcile.service 0644 <<'EOF'
+[Unit]
+Description=Reconcile Docker with companion storage availability
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/arm-companion-docker-storage-guard.sh reconcile
+EOF
+
+  install_root_file /etc/systemd/system/arm-companion-docker-storage-reconcile.timer 0644 <<EOF
+[Unit]
+Description=Periodically reconcile Docker with companion storage availability
+
+[Timer]
+OnBootSec=20s
+OnUnitActiveSec=${DOCKER_STORAGE_GUARD_INTERVAL_SECONDS}s
+AccuracySec=3s
+Unit=arm-companion-docker-storage-reconcile.service
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  as_root systemctl daemon-reload
+  as_root systemctl disable --now docker.socket || true
+  as_root systemctl enable --now arm-companion-docker-storage-reconcile.timer
+  as_root systemctl start arm-companion-docker-storage-reconcile.service || true
+}
+
 configure_avahi() {
   [ "$ENABLE_AVAHI_FIX" = "1" ] || return 0
   require_var AVAHI_ALLOW_INTERFACES
@@ -541,20 +873,122 @@ configure_nfs_client() {
   require_var NFS_SERVER
   require_var NFS_EXPORT
   require_var NFS_MOUNT
+  case "$NFS_RECONCILE_MODE" in
+    automount|direct) ;;
+    *) die "NFS_RECONCILE_MODE must be automount or direct" ;;
+  esac
   as_root mkdir -p "$NFS_MOUNT"
-  line="$NFS_SERVER:$NFS_EXPORT $NFS_MOUNT nfs4 rw,hard,intr,_netdev,nofail,x-systemd.automount,x-systemd.idle-timeout=60 0 0"
-  if grep -F " $NFS_MOUNT nfs" /etc/fstab >/dev/null 2>&1; then
-    log "NFS mount already present in /etc/fstab"
+
+  if [ -n "$NFS_MOUNT_OPTIONS" ]; then
+    nfs_mount_options=$NFS_MOUNT_OPTIONS
+  else
+    case "$NFS_RECONCILE_MODE" in
+      direct)
+        nfs_mount_options=rw,soft,timeo=50,retrans=2,nolock,_netdev,nofail,x-systemd.mount-timeout=10
+        ;;
+      *)
+        nfs_mount_options=rw,hard,intr,_netdev,nofail,x-systemd.automount,x-systemd.idle-timeout=60
+        ;;
+    esac
+  fi
+
+  line="$NFS_SERVER:$NFS_EXPORT $NFS_MOUNT nfs4 $nfs_mount_options 0 0"
+  if [ "$DRY_RUN" = "1" ]; then
+    log "would replace or append in /etc/fstab: $line"
   else
     backup_file /etc/fstab
-    if [ "$DRY_RUN" = "1" ]; then
-      log "would append to /etc/fstab: $line"
-    else
-      printf '%s\n' "$line" | sudo tee -a /etc/fstab >/dev/null
-    fi
+    tmp=$(mktemp)
+    awk -v mountpoint="$NFS_MOUNT" '$2 != mountpoint { print }' /etc/fstab > "$tmp"
+    printf '%s\n' "$line" >> "$tmp"
+    sudo install -m 0644 "$tmp" /etc/fstab
+    rm -f "$tmp"
   fi
 
   mount_json=$(shell_quote "$NFS_MOUNT")
+  export_json=$(shell_quote "$NFS_SERVER:$NFS_EXPORT")
+
+  if [ "$NFS_RECONCILE_MODE" = "direct" ]; then
+    install_root_file /usr/local/bin/arm-companion-nfs-reconcile.sh 0755 <<EOF
+#!/bin/sh
+set -eu
+mount_point=$mount_json
+expected_export=$export_json
+check_timeout=${NFS_RECONCILE_INTERVAL_SECONDS}
+
+mounted() {
+  findmnt -rn -M "\$mount_point" >/dev/null 2>&1
+}
+
+mounted_source_ok() {
+  mounted || return 1
+  source_mount=\$(findmnt -rn -o SOURCE -M "\$mount_point" 2>/dev/null || true)
+  [ "\$source_mount" = "\$expected_export" ]
+}
+
+responding() {
+  timeout "\$check_timeout" ls "\$mount_point" >/dev/null 2>&1
+}
+
+start_mount() {
+  mount_unit=\$(systemd-escape --path --suffix=mount "\$mount_point")
+  mkdir -p "\$mount_point"
+  systemctl start "\$mount_unit" >/dev/null 2>&1 || mount "\$mount_point" >/dev/null 2>&1
+}
+
+stop_mount() {
+  mount_unit=\$(systemd-escape --path --suffix=mount "\$mount_point")
+  systemctl stop "\$mount_unit" >/dev/null 2>&1 || true
+  umount -lf "\$mount_point" >/dev/null 2>&1 || true
+}
+
+if mounted_source_ok && responding; then
+  exit 0
+fi
+if mounted; then
+  stop_mount
+fi
+start_mount
+if mounted_source_ok && responding; then
+  exit 0
+fi
+exit 1
+EOF
+
+    install_root_file /etc/systemd/system/arm-companion-nfs-reconcile.service 0644 <<'EOF'
+[Unit]
+Description=Reconcile ARM companion NFS bind source when it becomes stale
+After=network-online.target
+
+[Service]
+Type=oneshot
+TimeoutStartSec=30
+ExecStart=/usr/local/bin/arm-companion-nfs-reconcile.sh
+EOF
+
+    install_root_file /etc/systemd/system/arm-companion-nfs-reconcile.timer 0644 <<EOF
+[Unit]
+Description=Run ARM companion NFS reconcile watchdog
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=${NFS_RECONCILE_INTERVAL_SECONDS}s
+AccuracySec=2s
+Unit=arm-companion-nfs-reconcile.service
+
+[Install]
+WantedBy=timers.target
+EOF
+    as_root systemctl daemon-reload
+    mount_unit=$(systemd-escape --path --suffix=mount "$NFS_MOUNT")
+    automount_unit=$(systemd-escape --path --suffix=automount "$NFS_MOUNT")
+    as_root systemctl disable --now arm-companion-nfs-remount.timer || true
+    as_root systemctl stop arm-companion-nfs-remount.service "$automount_unit" "$mount_unit" || true
+    as_root umount -lf "$NFS_MOUNT" || true
+    as_root systemctl enable --now arm-companion-nfs-reconcile.timer
+    as_root systemctl start arm-companion-nfs-reconcile.service || true
+    return 0
+  fi
+
   install_root_file /usr/local/bin/arm-companion-nfs-remount.sh 0755 <<EOF
 #!/bin/sh
 set -eu
@@ -579,13 +1013,13 @@ Type=oneshot
 ExecStart=/usr/local/bin/arm-companion-nfs-remount.sh
 EOF
 
-  install_root_file /etc/systemd/system/arm-companion-nfs-remount.timer 0644 <<'EOF'
+  install_root_file /etc/systemd/system/arm-companion-nfs-remount.timer 0644 <<EOF
 [Unit]
 Description=Run ARM companion NFS remount watchdog
 
 [Timer]
 OnBootSec=30s
-OnUnitActiveSec=10s
+OnUnitActiveSec=${NFS_RECONCILE_INTERVAL_SECONDS}s
 AccuracySec=2s
 Unit=arm-companion-nfs-remount.service
 
@@ -593,6 +1027,7 @@ Unit=arm-companion-nfs-remount.service
 WantedBy=timers.target
 EOF
   as_root systemctl daemon-reload
+  as_root systemctl disable --now arm-companion-nfs-reconcile.timer || true
   as_root systemctl enable --now arm-companion-nfs-remount.timer
 }
 
@@ -602,8 +1037,8 @@ configure_lan_docker_proxy() {
   install_root_file /etc/systemd/system/arm-companion-docker-proxy.service 0644 <<EOF
 [Unit]
 Description=ARM companion Docker socket LAN proxy
-Requires=docker.socket
-After=network-online.target docker.service docker.socket
+Requires=docker.service
+After=network-online.target docker.service
 
 [Service]
 Type=simple
@@ -629,8 +1064,10 @@ cmd_companion_local() {
   esac
   install_companion_packages
   install_docker_engine
+  configure_usb_storage_power_policy
   configure_storage_mount
   configure_docker_daemon
+  configure_docker_storage_guard
   target_user=${SUDO_USER:-$(id -un)}
   as_root groupadd -f docker
   as_root usermod -aG docker "$target_user" || true
@@ -645,10 +1082,16 @@ remote_env_pairs() {
   for name in \
     DOCKER_CONTEXT_NAME CONFIGURE_DOCKER_DAEMON DOCKER_APT_OS \
     DOCKER_APT_SUITE COMPANION_DOCKER_DATA_ROOT DOCKER_LOG_MAX_SIZE \
-    DOCKER_LOG_MAX_FILE CONFIGURE_STORAGE_MOUNT COMPANION_STORAGE_UUID \
+    DOCKER_LOG_MAX_FILE ENABLE_DOCKER_STORAGE_GUARD \
+    DOCKER_STORAGE_GUARD_INTERVAL_SECONDS ENABLE_USB_STORAGE_POWER_POLICY \
+    USB_STORAGE_BRIDGE_VENDOR_ID USB_STORAGE_BRIDGE_PRODUCT_ID \
+    ENABLE_USB_STORAGE_RECOVERY_REBOOT \
+    USB_STORAGE_RECOVERY_MIN_UPTIME_SECONDS USB_STORAGE_RECOVERY_REBOOT_COOLDOWN_SECONDS \
+    CONFIGURE_STORAGE_MOUNT COMPANION_STORAGE_UUID \
     COMPANION_STORAGE_MOUNT COMPANION_STORAGE_FSTYPE ENABLE_AVAHI_FIX \
     AVAHI_ALLOW_INTERFACES ENABLE_NFS_CLIENT NFS_SERVER NFS_EXPORT \
-    NFS_MOUNT ENABLE_LAN_DOCKER_PROXY DOCKER_PROXY_BIND DOCKER_PROXY_PORT \
+    NFS_MOUNT NFS_MOUNT_OPTIONS NFS_RECONCILE_MODE \
+    NFS_RECONCILE_INTERVAL_SECONDS ENABLE_LAN_DOCKER_PROXY DOCKER_PROXY_BIND DOCKER_PROXY_PORT \
     DOCKER_PROXY_ALLOW_CIDR DRY_RUN
   do
     eval "value=\${$name:-}"
@@ -841,11 +1284,13 @@ ensure_context_for_dev_tunnels() {
   have docker || die "docker CLI is required"
   for endpoint in $(docker_endpoint_candidates); do
     if [ "$DRY_RUN" = "1" ]; then
+      DEV_TUNNEL_ACTIVE_DOCKER_ENDPOINT=$endpoint
       update_docker_context_endpoint "$endpoint"
       log "docker context ready: $DOCKER_CONTEXT_NAME -> $endpoint"
       return 0
     fi
     if docker_endpoint_is_reachable "$endpoint"; then
+      DEV_TUNNEL_ACTIVE_DOCKER_ENDPOINT=$endpoint
       update_docker_context_endpoint "$endpoint"
       log "docker context ready: $DOCKER_CONTEXT_NAME -> $endpoint"
       return 0
@@ -1036,15 +1481,46 @@ start_forwards_for_docker_published_ports() {
   [ "$DEV_TUNNEL_AUTO_DOCKER_PORTS" = "1" ] || return 0
   have docker || die "docker CLI is required"
   published_file=$(mktemp)
-  if ! docker --context "$DOCKER_CONTEXT_NAME" ps --format '{{.Names}}	{{.Ports}}' > "$published_file"; then
-    rm -f "$published_file"
+  docker_ps_err=$(mktemp)
+  if [ -n "$DEV_TUNNEL_ACTIVE_DOCKER_ENDPOINT" ]; then
+    docker_ps_status=0
+    docker --host "$DEV_TUNNEL_ACTIVE_DOCKER_ENDPOINT" ps --format '{{.Names}}|{{.Ports}}' > "$published_file" 2>"$docker_ps_err" || docker_ps_status=$?
+  else
+    docker_ps_status=0
+    docker --context "$DOCKER_CONTEXT_NAME" ps --format '{{.Names}}|{{.Ports}}' > "$published_file" 2>"$docker_ps_err" || docker_ps_status=$?
+  fi
+  if [ "$docker_ps_status" -ne 0 ]; then
+    ssh_target=$(dev_tunnel_ssh_target)
+    if [ -s "$docker_ps_err" ]; then
+      first_error=$(sed -n '1p' "$docker_ps_err")
+      log "Docker port inspection failed (exit $docker_ps_status): $first_error"
+    else
+      log "Docker port inspection failed (exit $docker_ps_status) with no stderr"
+    fi
+    : > "$docker_ps_err"
+    log "trying SSH Docker port inspection: $ssh_target"
+    docker_ps_status=0
+    ssh -o BatchMode=yes -o ConnectTimeout="$DEV_TUNNEL_DOCKER_PROBE_TIMEOUT_SECONDS" \
+      "$ssh_target" "docker ps --format '{{.Names}}|{{.Ports}}'" > "$published_file" 2>"$docker_ps_err" || docker_ps_status=$?
+  fi
+  if [ "$docker_ps_status" -ne 0 ]; then
+    if [ -s "$docker_ps_err" ]; then
+      first_error=$(sed -n '1p' "$docker_ps_err")
+      log "SSH Docker port inspection failed (exit $docker_ps_status): $first_error"
+    else
+      log "SSH Docker port inspection failed (exit $docker_ps_status) with no stderr"
+    fi
+    rm -f "$published_file" "$docker_ps_err"
     if [ "$DEV_TUNNEL_SOFT_FAIL" = "1" ]; then
       log "could not inspect published Docker ports; will retry later"
       return 1
     fi
     die "could not inspect published Docker ports"
   fi
-  while IFS='	' read -r container_name published_ports; do
+  published_rows=$(cat "$published_file")
+  rm -f "$published_file" "$docker_ps_err"
+
+  printf '%s\n' "$published_rows" | while IFS='|' read -r container_name published_ports; do
     [ -n "$published_ports" ] || continue
     printf '%s\n' "$published_ports" | tr ',' '\n' | while IFS= read -r port_mapping; do
       case "$port_mapping" in
@@ -1055,8 +1531,7 @@ start_forwards_for_docker_published_ports() {
           ;;
       esac
     done
-  done < "$published_file"
-  rm -f "$published_file"
+  done
 }
 
 project_manifest_label() {

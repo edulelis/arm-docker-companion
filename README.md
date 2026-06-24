@@ -89,8 +89,9 @@ On ARM Linux companion:
 - Docker group membership for the login user.
 - Optional Docker daemon config with data-root, log rotation, and live-restore.
 - Optional persistent SSD fstab mount.
+- Optional fail-closed storage guard that stops Docker when the expected SSD/NVMe is absent and restarts it when storage returns.
 - Optional Avahi `allow-interfaces` fix for mDNS reliability.
-- Optional NFS client mount and systemd remount watchdog.
+- Optional NFS client mount with either the original automount watchdog or a direct remount/reconcile timer for stale sleep/restart cases.
 - Optional systemd `socat` Docker socket LAN proxy.
 
 For Armbian, the installer maps Ubuntu codenames such as `noble` to Docker's Ubuntu apt repository. If your derivative distro reports unusual metadata, set `DOCKER_APT_OS=ubuntu|debian` and `DOCKER_APT_SUITE=<codename>` in `.env`.
@@ -142,6 +143,52 @@ COMPANION_DOCKER_DATA_ROOT=/mnt/companion-ssd/docker
 
 The installer does not format disks. Create filesystems and backups yourself.
 
+For boards that boot from SD/eMMC but should never let Docker silently fall back
+to the wrong disk, enable the fail-closed guard:
+
+```sh
+CONFIGURE_STORAGE_MOUNT=1
+COMPANION_STORAGE_UUID=your-filesystem-uuid
+COMPANION_STORAGE_MOUNT=/mnt/companion-ssd
+CONFIGURE_DOCKER_DAEMON=1
+COMPANION_DOCKER_DATA_ROOT=/mnt/companion-ssd/docker
+ENABLE_DOCKER_STORAGE_GUARD=1
+DOCKER_STORAGE_GUARD_INTERVAL_SECONDS=15
+```
+
+This keeps `docker.service` from starting unless the expected storage UUID is
+mounted under the companion storage path and the Docker data root resolves to
+that same filesystem. It also disables `docker.socket` so socket activation
+cannot resurrect Docker against the wrong storage path.
+
+For USB SSDs, you can also disable USB autosuspend and keep USB power control
+forced on:
+
+```sh
+ENABLE_USB_STORAGE_POWER_POLICY=1
+USB_STORAGE_BRIDGE_VENDOR_ID=0bda
+USB_STORAGE_BRIDGE_PRODUCT_ID=9210
+```
+
+The vendor/product IDs are optional. When provided, udev also triggers the
+storage reconcile service when that bridge changes state.
+
+Some USB SSD bridges can fail before Linux sees a block device after a power
+event. In that case the guard cannot mount anything because `/dev/disk/by-uuid`
+never appears. For that specific failure mode, opt into a rate-limited reboot:
+
+```sh
+ENABLE_DOCKER_STORAGE_GUARD=1
+ENABLE_USB_STORAGE_RECOVERY_REBOOT=1
+USB_STORAGE_RECOVERY_MIN_UPTIME_SECONDS=180
+USB_STORAGE_RECOVERY_REBOOT_COOLDOWN_SECONDS=21600
+```
+
+The reboot path only triggers when the expected storage UUID is absent and
+recent kernel logs show USB descriptor or enumeration failures. It is off by
+default because a host reboot is disruptive and cannot repair a physically
+unplugged drive.
+
 ## Optional NFS Bind Mounts
 
 If containers on the companion need a project checkout from the Mac:
@@ -163,6 +210,21 @@ Run:
 ./install.sh mac-nfs-export
 ./install.sh companion-remote
 ```
+
+If stale automount state becomes the problem after Mac sleep or either machine
+restarts, switch the companion to direct mount reconcile mode:
+
+```sh
+ENABLE_NFS_CLIENT=1
+NFS_SERVER=mac.local
+NFS_EXPORT=/Users/you/Repositories/project
+NFS_MOUNT=/Users/you/Repositories/project
+NFS_RECONCILE_MODE=direct
+NFS_RECONCILE_INTERVAL_SECONDS=15
+```
+
+That mode avoids `x-systemd.automount` and uses a timer to force-unmount and
+remount stale NFS state instead.
 
 ## Commands
 
