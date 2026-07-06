@@ -16,6 +16,7 @@ COMPANION_HOST_FALLBACKS=${COMPANION_HOST_FALLBACKS:-}
 COMPANION_USER=${COMPANION_USER:-}
 COMPANION_SSH_ALIAS=${COMPANION_SSH_ALIAS:-$DOCKER_CONTEXT_NAME}
 COMPANION_SSH_HOST=${COMPANION_SSH_HOST:-}
+COMPANION_SSH_FALLBACK_HOSTS=${COMPANION_SSH_FALLBACK_HOSTS:-$COMPANION_HOST_FALLBACKS}
 COMPANION_SSH_IDENTITY_FILE=${COMPANION_SSH_IDENTITY_FILE:-}
 COMPANION_DOCKER_ENDPOINT=${COMPANION_DOCKER_ENDPOINT:-}
 COMPANION_DOCKER_ENDPOINT_FALLBACKS=${COMPANION_DOCKER_ENDPOINT_FALLBACKS:-}
@@ -214,6 +215,30 @@ companion_ssh_host() {
   printf '%s' "$COMPANION_HOST"
 }
 
+is_safe_ssh_host_token() {
+  case "$1" in
+    ''|*[!A-Za-z0-9._:\[\]-]*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+ssh_proxy_command_line() {
+  primary_host=$1
+  [ -n "$COMPANION_SSH_FALLBACK_HOSTS" ] || return 0
+
+  for host in $primary_host $COMPANION_SSH_FALLBACK_HOSTS; do
+    is_safe_ssh_host_token "$host" ||
+      die "unsafe SSH fallback host token: $host"
+  done
+
+  printf '%s' "  ProxyCommand sh -c 'for host do nc -G 5 \"\$host\" 22 && exit 0; done; exit 1' proxy"
+  printf ' %s' "$primary_host"
+  for host in $COMPANION_SSH_FALLBACK_HOSTS; do
+    printf ' %s' "$host"
+  done
+  printf '\n'
+}
+
 mac_formulae() {
   printf '%s\n' git jq docker docker-buildx docker-compose colima lima socat coreutils shellcheck
 }
@@ -311,11 +336,13 @@ configure_mac_ssh() {
   if [ -n "$COMPANION_USER" ]; then
     user_line="  User $COMPANION_USER"
   fi
+  proxy_line=$(ssh_proxy_command_line "$ssh_host")
   block=$(cat <<EOF
 Host $COMPANION_SSH_ALIAS
   HostName $ssh_host
 $user_line
 $identity_line
+$proxy_line
   ControlMaster auto
   ControlPath ~/.ssh/cm-%r@%h:%p
   ControlPersist 300
@@ -1672,6 +1699,7 @@ EOF
   install -m 0644 "$tmp" "$plist"
   rm -f "$tmp"
   launchctl bootout "gui/$(id -u)" "$plist" >/dev/null 2>&1 || true
+  launchctl enable "gui/$(id -u)/$DEV_TUNNEL_LAUNCHD_LABEL" >/dev/null 2>&1 || true
   launchctl bootstrap "gui/$(id -u)" "$plist"
   launchctl kickstart -k "gui/$(id -u)/$DEV_TUNNEL_LAUNCHD_LABEL" || true
   log "launchd agent installed: $plist"

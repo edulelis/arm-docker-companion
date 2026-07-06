@@ -122,12 +122,14 @@ second cap when the Radxa is temporarily unreachable. Individual Docker
 endpoint probes are bounded to 5 seconds when `gtimeout`/`timeout` is
 available.
 
-If the primary companion hostname is intermittently stale, set `COMPANION_HOST_FALLBACKS` to a
-direct IP or alternate hostname. The tunnel healer will try the mDNS Docker
-endpoint first and then equivalent fallback endpoints before giving up for that
-watch pass. When `COMPANION_SSH_ALIAS` is configured, it also tries the SSH
-Docker endpoint as a transport fallback after TCP endpoint candidates. Set
-`COMPANION_SSH_HOST` too when the generated SSH alias should use the direct IP.
+If the primary companion hostname is intermittently stale, set
+`COMPANION_HOST_FALLBACKS` to a direct IP or alternate hostname. The tunnel
+healer will try the mDNS Docker endpoint first and then equivalent fallback
+endpoints before giving up for that watch pass. When `COMPANION_SSH_ALIAS` is
+configured, it also tries the SSH Docker endpoint as a transport fallback after
+TCP endpoint candidates. The generated SSH alias uses `COMPANION_SSH_HOST` as
+its primary hostname and uses `COMPANION_SSH_FALLBACK_HOSTS` as SSH fallbacks;
+`COMPANION_SSH_FALLBACK_HOSTS` defaults to `COMPANION_HOST_FALLBACKS`.
 
 ## NFS Mount Recovery
 

@@ -104,7 +104,9 @@ the tunnel healer tries the original endpoint first and then equivalent
 endpoints with each fallback host. When an SSH alias is configured, the healer
 also tries `ssh://$COMPANION_SSH_ALIAS` as a transport fallback after TCP
 endpoint candidates. Use `COMPANION_SSH_HOST` when the generated SSH alias
-should point at a direct IP instead of the primary host name.
+should point at a different primary hostname. By default the generated SSH
+alias also tries `COMPANION_HOST_FALLBACKS` through a Mac-side `ProxyCommand`;
+set `COMPANION_SSH_FALLBACK_HOSTS` when SSH needs a different fallback list.
 For endpoints that cannot be derived from the primary host, set full
 space-separated `COMPANION_DOCKER_ENDPOINT_FALLBACKS`. Tune
 `DEV_TUNNEL_DOCKER_PROBE_TIMEOUT_SECONDS` if a network needs longer probes.
