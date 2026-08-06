@@ -40,6 +40,18 @@ DOCKER_LOG_MAX_SIZE=${DOCKER_LOG_MAX_SIZE:-100m}
 DOCKER_LOG_MAX_FILE=${DOCKER_LOG_MAX_FILE:-3}
 ENABLE_DOCKER_STORAGE_GUARD=${ENABLE_DOCKER_STORAGE_GUARD:-0}
 DOCKER_STORAGE_GUARD_INTERVAL_SECONDS=${DOCKER_STORAGE_GUARD_INTERVAL_SECONDS:-15}
+ENABLE_DOCKER_STALE_CLEANUP=${ENABLE_DOCKER_STALE_CLEANUP:-0}
+DOCKER_STALE_AFTER_HOURS=${DOCKER_STALE_AFTER_HOURS:-168}
+DOCKER_CLEANUP_STALE_CONTAINERS=${DOCKER_CLEANUP_STALE_CONTAINERS:-1}
+DOCKER_CLEANUP_RUNNING_CONTAINERS=${DOCKER_CLEANUP_RUNNING_CONTAINERS:-0}
+DOCKER_CLEANUP_CONTAINER_VOLUMES=${DOCKER_CLEANUP_CONTAINER_VOLUMES:-0}
+DOCKER_CLEANUP_UNUSED_VOLUMES=${DOCKER_CLEANUP_UNUSED_VOLUMES:-0}
+DOCKER_CLEANUP_IMAGES=${DOCKER_CLEANUP_IMAGES:-1}
+DOCKER_CLEANUP_NETWORKS=${DOCKER_CLEANUP_NETWORKS:-1}
+DOCKER_CLEANUP_BUILD_CACHE=${DOCKER_CLEANUP_BUILD_CACHE:-1}
+DOCKER_PROTECTED_NAME_REGEX=${DOCKER_PROTECTED_NAME_REGEX:-^buildx_buildkit_.*$}
+DOCKER_CLEANUP_KEEP_LABEL=${DOCKER_CLEANUP_KEEP_LABEL:-docker.cleanup.keep}
+DOCKER_REQUIRE_DATA_ROOT_MOUNT=${DOCKER_REQUIRE_DATA_ROOT_MOUNT:-0}
 ENABLE_USB_STORAGE_POWER_POLICY=${ENABLE_USB_STORAGE_POWER_POLICY:-0}
 USB_STORAGE_BRIDGE_VENDOR_ID=${USB_STORAGE_BRIDGE_VENDOR_ID:-}
 USB_STORAGE_BRIDGE_PRODUCT_ID=${USB_STORAGE_BRIDGE_PRODUCT_ID:-}
@@ -859,6 +871,92 @@ EOF
   as_root systemctl start arm-companion-docker-storage-reconcile.service || true
 }
 
+configure_docker_stale_cleanup() {
+  cleanup_flag_value=
+  for cleanup_flag in \
+    ENABLE_DOCKER_STALE_CLEANUP DOCKER_CLEANUP_STALE_CONTAINERS \
+    DOCKER_CLEANUP_RUNNING_CONTAINERS DOCKER_CLEANUP_CONTAINER_VOLUMES \
+    DOCKER_CLEANUP_UNUSED_VOLUMES DOCKER_CLEANUP_IMAGES \
+    DOCKER_CLEANUP_NETWORKS DOCKER_CLEANUP_BUILD_CACHE \
+    DOCKER_REQUIRE_DATA_ROOT_MOUNT
+  do
+    eval "cleanup_flag_value=\${$cleanup_flag}"
+    case "$cleanup_flag_value" in
+      0|1) ;;
+      *) die "$cleanup_flag must be 0 or 1" ;;
+    esac
+  done
+
+  if [ "$ENABLE_DOCKER_STALE_CLEANUP" != "1" ]; then
+    if [ -r /etc/default/docker-stale-cleanup ] &&
+       grep -Fq '# Managed by arm-docker-companion.' /etc/default/docker-stale-cleanup; then
+      as_root systemctl disable --now docker-stale-cleanup.timer || true
+    fi
+    return 0
+  fi
+  case "$DOCKER_STALE_AFTER_HOURS" in
+    ''|*[!0-9]*|0) die "DOCKER_STALE_AFTER_HOURS must be a positive integer" ;;
+  esac
+  require_var DOCKER_CLEANUP_KEEP_LABEL
+
+  cleanup_source="$SCRIPT_DIR/docker-stale-cleanup.sh"
+  [ -r "$cleanup_source" ] || die "cleanup module is missing: $cleanup_source"
+
+  cleanup_data_root_q=$(shell_quote "$COMPANION_DOCKER_DATA_ROOT")
+  cleanup_regex_q=$(shell_quote "$DOCKER_PROTECTED_NAME_REGEX")
+  cleanup_label_q=$(shell_quote "$DOCKER_CLEANUP_KEEP_LABEL")
+
+  install_root_file /usr/local/sbin/docker-stale-cleanup 0755 < "$cleanup_source"
+  install_root_file /etc/default/docker-stale-cleanup 0644 <<EOF
+# Managed by arm-docker-companion. Edit the companion .env and rerun the installer.
+DOCKER_STALE_CLEANUP_ENABLED=1
+DOCKER_DATA_ROOT=$cleanup_data_root_q
+DOCKER_STALE_AFTER_HOURS=$DOCKER_STALE_AFTER_HOURS
+DOCKER_CLEANUP_STALE_CONTAINERS=$DOCKER_CLEANUP_STALE_CONTAINERS
+DOCKER_CLEANUP_RUNNING_CONTAINERS=$DOCKER_CLEANUP_RUNNING_CONTAINERS
+DOCKER_CLEANUP_CONTAINER_VOLUMES=$DOCKER_CLEANUP_CONTAINER_VOLUMES
+DOCKER_CLEANUP_UNUSED_VOLUMES=$DOCKER_CLEANUP_UNUSED_VOLUMES
+DOCKER_CLEANUP_IMAGES=$DOCKER_CLEANUP_IMAGES
+DOCKER_CLEANUP_NETWORKS=$DOCKER_CLEANUP_NETWORKS
+DOCKER_CLEANUP_BUILD_CACHE=$DOCKER_CLEANUP_BUILD_CACHE
+DOCKER_PROTECTED_NAME_REGEX=$cleanup_regex_q
+DOCKER_CLEANUP_KEEP_LABEL=$cleanup_label_q
+DOCKER_REQUIRE_DATA_ROOT_MOUNT=$DOCKER_REQUIRE_DATA_ROOT_MOUNT
+EOF
+
+  install_root_file /etc/systemd/system/docker-stale-cleanup.service 0644 <<'EOF'
+[Unit]
+Description=Remove stale Docker workloads and unused data
+After=docker.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/default/docker-stale-cleanup
+ExecStart=/usr/local/sbin/docker-stale-cleanup prune
+Nice=19
+IOSchedulingClass=idle
+TimeoutStartSec=6h
+EOF
+
+  install_root_file /etc/systemd/system/docker-stale-cleanup.timer 0644 <<'EOF'
+[Unit]
+Description=Daily cleanup of stale Docker workloads and unused data
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+RandomizedDelaySec=30m
+AccuracySec=1m
+Unit=docker-stale-cleanup.service
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  as_root systemctl daemon-reload
+  as_root systemctl enable --now docker-stale-cleanup.timer
+}
+
 configure_avahi() {
   [ "$ENABLE_AVAHI_FIX" = "1" ] || return 0
   require_var AVAHI_ALLOW_INTERFACES
@@ -1095,6 +1193,7 @@ cmd_companion_local() {
   configure_storage_mount
   configure_docker_daemon
   configure_docker_storage_guard
+  configure_docker_stale_cleanup
   target_user=${SUDO_USER:-$(id -un)}
   as_root groupadd -f docker
   as_root usermod -aG docker "$target_user" || true
@@ -1111,6 +1210,11 @@ remote_env_pairs() {
     DOCKER_APT_SUITE COMPANION_DOCKER_DATA_ROOT DOCKER_LOG_MAX_SIZE \
     DOCKER_LOG_MAX_FILE ENABLE_DOCKER_STORAGE_GUARD \
     DOCKER_STORAGE_GUARD_INTERVAL_SECONDS ENABLE_USB_STORAGE_POWER_POLICY \
+    ENABLE_DOCKER_STALE_CLEANUP DOCKER_STALE_AFTER_HOURS \
+    DOCKER_CLEANUP_STALE_CONTAINERS DOCKER_CLEANUP_RUNNING_CONTAINERS \
+    DOCKER_CLEANUP_CONTAINER_VOLUMES DOCKER_CLEANUP_UNUSED_VOLUMES \
+    DOCKER_CLEANUP_IMAGES DOCKER_CLEANUP_NETWORKS DOCKER_CLEANUP_BUILD_CACHE \
+    DOCKER_PROTECTED_NAME_REGEX DOCKER_CLEANUP_KEEP_LABEL DOCKER_REQUIRE_DATA_ROOT_MOUNT \
     USB_STORAGE_BRIDGE_VENDOR_ID USB_STORAGE_BRIDGE_PRODUCT_ID \
     ENABLE_USB_STORAGE_RECOVERY_REBOOT \
     USB_STORAGE_RECOVERY_MIN_UPTIME_SECONDS USB_STORAGE_RECOVERY_REBOOT_COOLDOWN_SECONDS \
@@ -1131,6 +1235,7 @@ cmd_companion_remote() {
   remote_script=/tmp/arm-docker-companion-install.sh
   log "copying installer to $target"
   run scp "$SCRIPT_DIR/install.sh" "$target:$remote_script"
+  run scp "$SCRIPT_DIR/docker-stale-cleanup.sh" "$target:/tmp/docker-stale-cleanup.sh"
   env_pairs=$(remote_env_pairs)
   # shellcheck disable=SC2086
   run ssh $SSH_TTY_FLAGS "$target" "chmod +x $remote_script &&$env_pairs sh $remote_script companion-local"

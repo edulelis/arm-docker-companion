@@ -7,7 +7,7 @@ The common pattern is:
 - ARM Mac runs the Docker CLI, Compose, Buildx, editors, and project checkout.
 - ARM Linux companion runs the Docker Engine and containers.
 - Docker context connects the Mac to the companion, preferably over SSH.
-- Optional modules handle Colima fallback, SSD-backed Docker data, mDNS stability, NFS bind mounts, and a LAN Docker socket proxy.
+- Optional modules handle Colima fallback, SSD-backed Docker data, stale Docker cleanup, mDNS stability, NFS bind mounts, and a LAN Docker socket proxy.
 
 This was shaped around Radxa/Rockchip + Armbian, but it is generic for ARM64 Debian/Ubuntu/Armbian companions such as Radxa Rock, Raspberry Pi 5, Ampere boxes, and ARM mini PCs.
 
@@ -90,6 +90,7 @@ On ARM Linux companion:
 - Optional Docker daemon config with data-root, log rotation, and live-restore.
 - Optional persistent SSD fstab mount.
 - Optional fail-closed storage guard that stops Docker when the expected SSD/NVMe is absent and restarts it when storage returns.
+- Optional daily cleanup of stale containers, images, networks, volumes, and build cache.
 - Optional Avahi `allow-interfaces` fix for mDNS reliability.
 - Optional NFS client mount with either the original automount watchdog or a direct remount/reconcile timer for stale sleep/restart cases.
 - Optional systemd `socat` Docker socket LAN proxy.
@@ -189,6 +190,53 @@ recent kernel logs show USB descriptor or enumeration failures. It is off by
 default because a host reboot is disruptive and cannot repair a physically
 unplugged drive.
 
+## Optional Docker Cleanup
+
+The cleanup timer is disabled until explicitly enabled. Its conservative
+defaults remove stopped containers, unused images, networks, and build cache
+only after seven days. Running containers and volumes are preserved by
+default.
+
+```sh
+ENABLE_DOCKER_STALE_CLEANUP=1
+DOCKER_STALE_AFTER_HOURS=168
+DOCKER_CLEANUP_STALE_CONTAINERS=1
+DOCKER_CLEANUP_RUNNING_CONTAINERS=0
+DOCKER_CLEANUP_CONTAINER_VOLUMES=0
+DOCKER_CLEANUP_UNUSED_VOLUMES=0
+DOCKER_CLEANUP_IMAGES=1
+DOCKER_CLEANUP_NETWORKS=1
+DOCKER_CLEANUP_BUILD_CACHE=1
+DOCKER_PROTECTED_NAME_REGEX='^buildx_buildkit_.*$'
+DOCKER_CLEANUP_KEEP_LABEL=docker.cleanup.keep
+DOCKER_REQUIRE_DATA_ROOT_MOUNT=0
+```
+
+After applying the companion setup, preview the next run without deleting
+anything:
+
+```sh
+sudo docker-stale-cleanup plan
+```
+
+The timer runs daily with a randomized delay of up to 30 minutes. Container
+age means creation time, not last activity. Enabling running-container cleanup
+can therefore remove a healthy long-running service unless its name matches
+`DOCKER_PROTECTED_NAME_REGEX` or it has the keep label. A protected container
+also preserves the rest of its Docker Compose project.
+
+Setting `ENABLE_DOCKER_STALE_CLEANUP=0` and rerunning the installer disables a
+cleanup timer previously installed by this project without removing its files.
+
+To keep a container or Compose project independently of its name:
+
+```yaml
+services:
+  app:
+    labels:
+      docker.cleanup.keep: "true"
+```
+
 ## Optional NFS Bind Mounts
 
 If containers on the companion need a project checkout from the Mac:
@@ -247,7 +295,7 @@ remount stale NFS state instead.
 - No secrets belong in this repo.
 - `.env` is ignored by git.
 - Existing root-owned files are backed up before managed rewrites.
-- NFS and Docker TCP proxy modules are opt-in.
+- NFS, stale cleanup, and Docker TCP proxy modules are opt-in.
 - `DRY_RUN=1 ./install.sh <command>` previews many commands.
 
 ## References

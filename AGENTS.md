@@ -22,6 +22,8 @@ Ask for or infer these before setup:
 - Optional storage UUID and mount point if Docker data should live on SSD/NVMe.
 - Optional USB storage bridge vendor/product IDs if USB autosuspend hardening or USB recovery should be configured.
 - Optional NFS export/mount paths if containers need direct access to a Mac checkout.
+- Whether daily Docker cleanup is wanted, which object categories may be
+  purged, and the minimum stale age.
 
 ## Basic Agent Flow
 
@@ -103,6 +105,25 @@ Do not create filesystems or change partitions unless explicitly requested.
 For flaky USB SSD bridges, add `ENABLE_USB_STORAGE_POWER_POLICY=1` and bridge
 IDs from `lsusb`; use `ENABLE_USB_STORAGE_RECOVERY_REBOOT=1` only when the
 human accepts a rate-limited companion reboot after USB enumeration failures.
+
+## Optional Docker Cleanup
+
+Enable cleanup only after the human chooses the retention and purge scope.
+Keep running containers and volumes disabled unless explicitly requested, and
+run a non-destructive plan before the first purge:
+
+```sh
+ENABLE_DOCKER_STALE_CLEANUP=1
+DOCKER_STALE_AFTER_HOURS=168
+DOCKER_CLEANUP_RUNNING_CONTAINERS=0
+DOCKER_CLEANUP_CONTAINER_VOLUMES=0
+DOCKER_CLEANUP_UNUSED_VOLUMES=0
+./install.sh companion-remote
+ssh "$COMPANION_USER@$COMPANION_HOST" 'sudo docker-stale-cleanup plan'
+```
+
+Use the `docker.cleanup.keep=true` label or
+`DOCKER_PROTECTED_NAME_REGEX` for workloads that must never be removed.
 
 ## Optional NFS Path
 
